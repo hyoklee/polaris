@@ -1,0 +1,108 @@
+#!/bin/bash
+#PBS -N nvshmem_test
+#PBS -A gpu_hack
+#PBS -q debug
+#PBS -l select=2:ncpus=32:ngpus=4
+#PBS -l walltime=00:20:00
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/nvshmem_test.log
+
+set -e
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+NVHPC_ROOT="/soft/compilers/nvhpc/Linux_x86_64/24.11"
+NVCC="$NVHPC_ROOT/compilers/bin/nvcc"
+NVSHMEM_DIR="$NVHPC_ROOT/comm_libs/nvshmem"
+CUDA_LIB="$NVHPC_ROOT/cuda/12.6/lib64"
+FABRIC_LIB="/opt/cray/libfabric/2.2.0rc1/lib64"
+CMAKE_BIN=$(which cmake)
+BUILD_DIR="/lus/grand/projects/gpu_hack/iowarp/nvshmem_test"
+SRC_DIR="$HOME/bin"
+
+mkdir -p "$BUILD_DIR"
+
+echo "=== NVSHMEM UniqueID Init Test ==="
+echo "Date:      $(date)"
+echo "Job ID:    $PBS_JOBID"
+echo "Nodes:     $(sort -u $PBS_NODEFILE | tr '\n' ' ')"
+echo "NVSHMEM:   3.0.7 (NVHPC 24.11)"
+echo "Bootstrap: NVSHMEMX_INIT_WITH_UNIQUEID + shared Lustre file"
+echo "Launcher:  PALS mpiexec (no OpenMPI/SSH)"
+echo ""
+
+# ── Copy source files to build dir ───────────────────────────────────────────
+cp "$SRC_DIR/nvshmem_uniqueid_test.cu" "$BUILD_DIR/"
+cp "$SRC_DIR/CMakeLists_uid.txt"       "$BUILD_DIR/CMakeLists.txt"
+
+export CXX="$NVHPC_ROOT/compilers/bin/nvc++"
+export CUDACXX="$NVCC"
+mkdir -p "$BUILD_DIR/build_uid"
+rm -f "$BUILD_DIR/build_uid/CMakeCache.txt"
+
+echo "--- CMake configure (no MPI, uniqueid bootstrap) ---"
+$CMAKE_BIN -S "$BUILD_DIR" -B "$BUILD_DIR/build_uid" \
+    -DCMAKE_CUDA_COMPILER="$NVCC" \
+    -DNVSHMEM_PREFIX="$NVSHMEM_DIR" \
+    -DCUDA_HOME="$NVHPC_ROOT/cuda/12.6" \
+    -DCMAKE_CUDA_ARCHITECTURES=80 \
+    -DCMAKE_BUILD_TYPE=Release 2>&1
+
+echo "--- CMake build ---"
+$CMAKE_BIN --build "$BUILD_DIR/build_uid" --target nvshmem_uniqueid_test -j4 2>&1
+echo "Compile: OK"
+echo ""
+
+# ── Build fi_getinfo shim (bypass Cray libfabric 2.2.0rc1 ABI compat bug) ────
+SHIM_SRC="$HOME/bin/fi_getinfo_shim.c"
+SHIM_LIB="$BUILD_DIR/build_uid/libfi_getinfo_shim.so"
+echo "--- Building fi_getinfo shim ---"
+gcc -O2 -shared -fPIC -o "$SHIM_LIB" "$SHIM_SRC" \
+    -I/opt/cray/libfabric/2.2.0rc1/include \
+    -L/opt/cray/libfabric/2.2.0rc1/lib64 -lfabric -ldl 2>&1
+echo "Shim: OK ($SHIM_LIB)"
+echo ""
+
+# ── Runtime environment ───────────────────────────────────────────────────────
+export LD_LIBRARY_PATH="$NVSHMEM_DIR/lib:$CUDA_LIB:$FABRIC_LIB:${LD_LIBRARY_PATH:-}"
+export NVSHMEM_REMOTE_TRANSPORT=libfabric
+export FI_CXI_DISABLE_HOST_REGISTER=1
+export NVSHMEM_UNIQUEID_FILE="$BUILD_DIR/nvshmem_uid.bin"
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=hsn0
+export NVSHMEM_DISABLE_GDRCOPY=1
+export FI_HMEM_CUDA_USE_GDRCOPY=0
+export NVSHMEM_DISABLE_NCCL=1
+export NVSHMEM_DEBUG=INFO
+export LD_PRELOAD="$BUILD_DIR/build_uid/libfi_getinfo_shim.so"
+NCCL_LIB="/soft/compilers/nvhpc/Linux_x86_64/24.11/comm_libs/12.6/nccl/lib"
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$NCCL_LIB"
+# libfabric debug — show CXI provider messages
+export FI_LOG_LEVEL=warn
+export FI_LOG_PROV=cxi
+# Disable HMEM device registration which can crash without proper kernel support
+export FI_CXI_DISABLE_HMEM_DEV_REGISTER=1
+
+echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+echo ""
+
+# ── Run via PALS mpiexec (sets PMI_RANK / PMI_SIZE / PMI_LOCAL_RANK) ──────────
+echo "--- Running nvshmem_uniqueid_test (2 nodes x 4 GPUs = 8 PEs) ---"
+mpiexec -n 8 --ppn 4 \
+    --env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+    --env NVSHMEM_REMOTE_TRANSPORT=libfabric \
+    --env FI_CXI_DISABLE_HOST_REGISTER=1 \
+    --env NVSHMEM_UNIQUEID_FILE="$BUILD_DIR/nvshmem_uid.bin" \
+    --env NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=hsn0 \
+    --env NVSHMEM_DISABLE_GDRCOPY=1 \
+    --env FI_HMEM_CUDA_USE_GDRCOPY=0 \
+    --env NVSHMEM_DISABLE_NCCL=1 \
+    --env NVSHMEM_DEBUG=INFO \
+    --env FI_LOG_LEVEL=warn \
+    --env FI_LOG_PROV=cxi \
+    --env FI_CXI_DISABLE_HMEM_DEV_REGISTER=1 \
+    --env LD_PRELOAD="$BUILD_DIR/build_uid/libfi_getinfo_shim.so" \
+    --env CUDA_VISIBLE_DEVICES=0,1,2,3 \
+    "$BUILD_DIR/build_uid/nvshmem_uniqueid_test" 2>&1
+
+echo ""
+echo "=== NVSHMEM UniqueID Test Complete ==="

@@ -1,0 +1,110 @@
+#!/bin/bash
+#PBS -N datahub_server
+#PBS -A gpu_hack
+#PBS -q debug
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=00:50:00
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/datahub_server.log
+
+set -e
+
+APPTAINER_BIN="/soft/spack/base/0.8.1/install/linux-sles15-x86_64/gcc-12.3.0/apptainer-1.3.2-o4dxrioaegfbzftm2uzazrkn6tprrang/bin"
+export PATH="$APPTAINER_BIN:$PATH"
+
+STORAGE="/lus/grand/projects/gpu_hack/iowarp"
+DATAHUB_DIR="$STORAGE/datahub"
+SIF="$DATAHUB_DIR/datahub-gms.sif"
+SANDBOX="$DATAHUB_DIR/datahub-sandbox"
+STATE_DIR="$DATAHUB_DIR/state"
+mkdir -p "$STATE_DIR"
+
+MYHOST=$(hostname -f)
+INSTANCE="datahub-gms-$$"
+DATAHUB_PORT=8080
+DATAHUB_FRONTEND_PORT=9002
+
+echo "=== DataHub Server Job ==="
+echo "Date:     $(date)"
+echo "Host:     $MYHOST"
+echo "Job ID:   $PBS_JOBID"
+echo "SIF:      $SIF"
+echo ""
+
+# Determine image source: prefer SIF, fall back to sandbox
+if [ -f "$SIF" ]; then
+    IMAGE="$SIF"
+    echo "Using SIF: $SIF"
+elif [ -d "$SANDBOX" ]; then
+    IMAGE="$SANDBOX"
+    echo "Using sandbox: $SANDBOX"
+else
+    echo "ERROR: Neither SIF ($SIF) nor sandbox ($SANDBOX) found."
+    echo "fail" > "$STATE_DIR/datahub_test_result.txt"
+    echo "done" > "$STATE_DIR/datahub_test_done.txt"
+    exit 1
+fi
+
+# Write endpoint info for the test job to pick up
+echo "$MYHOST" > "$STATE_DIR/datahub_host.txt"
+echo "$MYHOST:$DATAHUB_PORT" > "$STATE_DIR/datahub_endpoint.txt"
+echo "$PBS_JOBID" > "$STATE_DIR/server_jobid.txt"
+rm -f "$STATE_DIR/datahub_test_done.txt" "$STATE_DIR/datahub_test_result.txt"
+
+echo "Endpoint: $MYHOST:$DATAHUB_PORT"
+echo "Instance: $INSTANCE"
+echo "Image:    $IMAGE"
+echo ""
+
+# Start DataHub GMS as an Apptainer instance
+# DataHub GMS listens on port 8080 by default
+echo "--- Starting DataHub GMS instance ---"
+APPTAINER_CACHEDIR="$STORAGE/cache" \
+apptainer instance start \
+    --writable-tmpfs \
+    --env DATAHUB_SERVER_PORT=$DATAHUB_PORT \
+    --env JAVA_OPTS="-Xmx512m -Xms256m" \
+    "$IMAGE" "$INSTANCE" 2>&1 || true
+
+apptainer instance list 2>&1
+
+# Give DataHub a moment to start
+echo "Waiting for DataHub GMS to initialize (30s)..."
+sleep 30
+
+# Check if GMS health endpoint responds
+echo "--- Health check ---"
+curl -sf "http://localhost:$DATAHUB_PORT/health" 2>/dev/null && \
+    echo "Health: OK" || echo "Health: not yet ready (deps may be missing)"
+
+# Signal that the server is ready for testing
+echo "ready" > "$STATE_DIR/datahub_server_ready.txt"
+echo "Server ready signal written."
+
+# Wait for test job to complete (up to 40 min)
+echo "--- Waiting for test job to signal completion ---"
+TIMEOUT=2400
+ELAPSED=0
+while [ $ELAPSED -lt $TIMEOUT ]; do
+    if [ -f "$STATE_DIR/datahub_test_done.txt" ]; then
+        echo "Test completed."
+        break
+    fi
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    if (( ELAPSED % 60 == 0 )); then
+        echo "  ...waiting (${ELAPSED}s elapsed)"
+    fi
+done
+
+if [ $ELAPSED -ge $TIMEOUT ]; then
+    echo "WARNING: Test did not complete within timeout."
+fi
+
+# Cleanup — keep endpoint/ready files until test has run;
+# the datahub wrapper (or next run) clears stale state.
+echo "--- Stopping DataHub GMS instance ---"
+apptainer instance stop "$INSTANCE" 2>&1 || true
+
+echo "=== DataHub Server Job Complete ==="

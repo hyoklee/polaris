@@ -1,0 +1,142 @@
+#!/bin/bash
+#PBS -N datahub_test
+#PBS -A gpu_hack
+#PBS -q debug
+#PBS -l select=1:ncpus=32
+#PBS -l walltime=00:20:00
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/datahub_test.log
+
+set -e
+
+APPTAINER_BIN="/soft/spack/base/0.8.1/install/linux-sles15-x86_64/gcc-12.3.0/apptainer-1.3.2-o4dxrioaegfbzftm2uzazrkn6tprrang/bin"
+export PATH="$APPTAINER_BIN:$PATH"
+
+STORAGE="/lus/grand/projects/gpu_hack/iowarp"
+DATAHUB_DIR="$STORAGE/datahub"
+STATE_DIR="$DATAHUB_DIR/state"
+
+MYHOST=$(hostname -f)
+DATAHUB_PORT=8080
+DATAHUB_FRONTEND_PORT=9002
+
+echo "=== DataHub Connectivity Test Job ==="
+echo "Date:     $(date)"
+echo "Host:     $MYHOST"
+echo "Job ID:   $PBS_JOBID"
+echo ""
+
+# ── Wait for server job to be ready ──────────────────────────────────────────
+echo "--- Waiting for DataHub server to become ready ---"
+TIMEOUT=600
+ELAPSED=0
+while [ $ELAPSED -lt $TIMEOUT ]; do
+    if [ -f "$STATE_DIR/datahub_server_ready.txt" ] && \
+       [ -f "$STATE_DIR/datahub_endpoint.txt" ]; then
+        break
+    fi
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    if (( ELAPSED % 30 == 0 )); then
+        echo "  ...waiting for server (${ELAPSED}s elapsed)"
+    fi
+done
+
+if [ ! -f "$STATE_DIR/datahub_endpoint.txt" ]; then
+    echo "FAIL: DataHub server did not become ready within ${TIMEOUT}s"
+    echo "fail" > "$STATE_DIR/datahub_test_result.txt"
+    echo "done" > "$STATE_DIR/datahub_test_done.txt"
+    exit 1
+fi
+
+DATAHUB_HOST=$(cat "$STATE_DIR/datahub_host.txt")
+SERVER_JOB=$(cat "$STATE_DIR/server_jobid.txt" 2>/dev/null || echo "unknown")
+echo "DataHub Host: $DATAHUB_HOST"
+echo "Server Job:   $SERVER_JOB"
+echo "Testing from: $MYHOST"
+echo ""
+
+# ── Port connectivity tests ───────────────────────────────────────────────────
+PASS=0
+FAIL=0
+
+test_port() {
+    local host=$1
+    local port=$2
+    local label=$3
+    echo -n "  $label ($host:$port) ... "
+    if nc -z -w 10 "$host" "$port" 2>/dev/null; then
+        echo "OPEN"
+        PASS=$((PASS + 1))
+    else
+        echo "CLOSED/UNREACHABLE"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+echo "--- Port connectivity tests ---"
+test_port "$DATAHUB_HOST" "$DATAHUB_PORT"          "GMS  (port 8080)"
+test_port "$DATAHUB_HOST" "$DATAHUB_FRONTEND_PORT" "Frontend (port 9002)"
+echo ""
+
+# ── HTTP response tests ───────────────────────────────────────────────────────
+echo "--- HTTP response tests ---"
+echo -n "  GMS /health ... "
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    --connect-timeout 10 --max-time 15 \
+    "http://$DATAHUB_HOST:$DATAHUB_PORT/health" 2>/dev/null || echo "000")
+echo "HTTP $HTTP_STATUS"
+if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "503" ]; then
+    echo "  GMS /health: REACHABLE (HTTP $HTTP_STATUS)"
+    PASS=$((PASS + 1))
+else
+    echo "  GMS /health: NOT REACHABLE (HTTP $HTTP_STATUS)"
+    FAIL=$((FAIL + 1))
+fi
+
+echo -n "  GMS /config ... "
+HTTP_STATUS2=$(curl -s -o /dev/null -w "%{http_code}" \
+    --connect-timeout 10 --max-time 15 \
+    "http://$DATAHUB_HOST:$DATAHUB_PORT/config" 2>/dev/null || echo "000")
+echo "HTTP $HTTP_STATUS2"
+echo ""
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo "=== Test Summary ==="
+echo "  From node:    $MYHOST"
+echo "  To node:      $DATAHUB_HOST"
+echo "  Tests passed: $PASS"
+echo "  Tests failed: $FAIL"
+echo ""
+
+if [ $PASS -gt 0 ] && [ $FAIL -eq 0 ]; then
+    echo "RESULT: PASS — DataHub ports are reachable across compute nodes."
+    RESULT="pass"
+elif [ $PASS -gt 0 ]; then
+    echo "RESULT: PARTIAL — Some DataHub ports reachable ($PASS passed, $FAIL failed)."
+    RESULT="partial"
+else
+    echo "RESULT: FAIL — No DataHub ports reachable."
+    RESULT="fail"
+fi
+
+echo "$RESULT" > "$STATE_DIR/datahub_test_result.txt"
+
+# ── Signal server job and request cleanup ────────────────────────────────────
+echo "done" > "$STATE_DIR/datahub_test_done.txt"
+
+# If SERVER_JOBID env var is set, qdel the server job
+if [ -n "${SERVER_JOBID:-}" ]; then
+    echo "Deleting server job $SERVER_JOBID ..."
+    qdel "$SERVER_JOBID" 2>/dev/null && echo "Server job deleted." || \
+        echo "qdel failed (job may have already finished)."
+fi
+
+# Self-delete (won't take effect until this script exits)
+if [ -n "$PBS_JOBID" ]; then
+    echo "Requesting self-deletion of test job $PBS_JOBID ..."
+    qdel "$PBS_JOBID" 2>/dev/null || true
+fi
+
+echo "=== DataHub Test Job Complete ==="

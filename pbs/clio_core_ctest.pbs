@@ -1,0 +1,110 @@
+#!/bin/bash
+#PBS -N clio_core_ctest
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=01:00:00
+#PBS -q debug
+#PBS -A gpu_hack
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/clio_core_ctest.log
+
+# Build ~/clio-core and run ctest -D Experimental to report to my.cdash.org/HERMES
+
+set -uo pipefail
+
+CLIO_SRC=/home/hyoklee/clio-core
+CLIO_BUILD=$CLIO_SRC/build-polaris
+NVIDIA_HDF5=/opt/cray/pe/hdf5-parallel/1.14.3.7/nvidia/23.3
+NVIDIA_MPICH=/opt/cray/pe/mpich/9.0.1/ofi/nvidia/23.3
+
+echo "==== clio-core CTest Experimental on Polaris ===="
+echo "Date:   $(date)"
+echo "Job:    $PBS_JOBID"
+echo "Node:   $(cat $PBS_NODEFILE | sort -u | tr '\n' ' ')"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] Compiler check
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [1] Compiler check ==="
+GCC_CXX=""
+GCC_CC=""
+for _ver in 12 13 14; do
+    if [ -x "/usr/bin/g++-${_ver}" ]; then
+        GCC_CXX="/usr/bin/g++-${_ver}"
+        GCC_CC="/usr/bin/gcc-${_ver}"
+        break
+    fi
+done
+if [ -z "$GCC_CXX" ]; then
+    echo "ERROR: no versioned g++ (g++-12/13/14) found in /usr/bin"
+    exit 1
+fi
+echo "  g++: $($GCC_CXX --version | head -1)"
+echo "  gcc: $($GCC_CC  --version | head -1)"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] Clean build directory
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [2] Prepare build directory ==="
+rm -rf $CLIO_BUILD
+mkdir -p $CLIO_BUILD
+echo "  Build dir: $CLIO_BUILD (clean)"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [3] CMake configure
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [3] CMake configure ==="
+cd $CLIO_BUILD
+
+cmake $CLIO_SRC \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_COMPILER=$GCC_CC \
+    -DCMAKE_CXX_COMPILER=$GCC_CXX \
+    -DWRP_CORE_ENABLE_TESTS=ON \
+    -DWRP_CORE_ENABLE_RUNTIME=ON \
+    -DWRP_CORE_ENABLE_CTE=OFF \
+    -DWRP_CORE_ENABLE_CAE=OFF \
+    -DWRP_CORE_ENABLE_CEE=OFF \
+    -DWRP_CORE_ENABLE_BENCHMARKS=OFF \
+    -DWRP_CORE_ENABLE_PYTHON=OFF \
+    -DWRP_CORE_ENABLE_MPI=ON \
+    -DWRP_CORE_ENABLE_HDF5=ON \
+    -DWRP_CORE_ENABLE_ZMQ=ON \
+    -DZeroMQ_ROOT=/home/hyoklee/miniconda3 \
+    -DWRP_CORE_ENABLE_CAE=OFF \
+    -DWRP_CORE_ENABLE_CEE=OFF \
+    -DWRP_CORE_ENABLE_IO_URING=ON \
+    -DHSHM_LOG_LEVEL=1 \
+    -DMPI_C_COMPILER=$NVIDIA_MPICH/bin/mpicc \
+    -DMPI_CXX_COMPILER=$NVIDIA_MPICH/bin/mpicxx \
+    -DMPIEXEC_EXECUTABLE:STRING=mpiexec \
+    -DHDF5_ROOT=$NVIDIA_HDF5 \
+    2>&1
+CMAKE_RC=$?
+if [ $CMAKE_RC -ne 0 ]; then
+    echo "ERROR: cmake configure failed (exit $CMAKE_RC)"
+    exit $CMAKE_RC
+fi
+echo "  CMake configure: OK"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [4] ctest -D Experimental (build + test + submit to CDash)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [4] ctest -D Experimental ==="
+cd $CLIO_BUILD
+
+export http_proxy=http://proxy.alcf.anl.gov:3128
+export https_proxy=http://proxy.alcf.anl.gov:3128
+
+ctest -D Experimental -j 16 2>&1
+CTEST_RC=$?
+
+echo ""
+echo "  ctest exit: $CTEST_RC"
+echo "  Results: https://my.cdash.org/index.php?project=HERMES"
+echo "==== Done ===="
+echo "Date: $(date)"

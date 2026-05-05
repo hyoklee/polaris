@@ -1,0 +1,89 @@
+#!/bin/bash
+# datahub — submit DataHub server + test jobs on Polaris compute nodes,
+#            monitor from login node, qdel both jobs when test succeeds.
+#
+# Usage: datahub
+
+set -euo pipefail
+
+STORAGE="/lus/grand/projects/gpu_hack/iowarp"
+DATAHUB_DIR="$STORAGE/datahub"
+STATE_DIR="$DATAHUB_DIR/state"
+mkdir -p "$STATE_DIR"
+
+# Clean stale state from previous runs
+rm -f "$STATE_DIR"/*.txt
+
+echo "=== DataHub Test Setup ==="
+echo "Storage:   $DATAHUB_DIR"
+echo "State:     $STATE_DIR"
+echo ""
+
+# ── Submit server job ────────────────────────────────────────────────────────
+echo "Submitting DataHub server job..."
+SERVER_JOBID=$(qsub /home/hyoklee/bin/datahub_server.pbs)
+echo "Server job: $SERVER_JOBID"
+
+# ── Submit test job with SERVER_JOBID passed via env ────────────────────────
+echo "Submitting DataHub test job..."
+TEST_JOBID=$(qsub -v SERVER_JOBID="$SERVER_JOBID" /home/hyoklee/bin/datahub_test.pbs) || {
+    echo "ERROR: Failed to submit test job (queue limit?). Deleting server job..."
+    qdel "$SERVER_JOBID" 2>/dev/null || true
+    exit 1
+}
+echo "Test job:   $TEST_JOBID"
+echo ""
+echo "Logs:"
+echo "  Server: ~/datahub_server.log"
+echo "  Test:   ~/datahub_test.log"
+echo ""
+
+# ── Monitor from login node ──────────────────────────────────────────────────
+echo "Monitoring... (Ctrl-C to abort)"
+TIMEOUT=3600   # 60 min overall timeout
+ELAPSED=0
+POLL=10
+
+while [ $ELAPSED -lt $TIMEOUT ]; do
+    sleep $POLL
+    ELAPSED=$((ELAPSED + POLL))
+
+    RESULT_FILE="$STATE_DIR/datahub_test_result.txt"
+    DONE_FILE="$STATE_DIR/datahub_test_done.txt"
+
+    # Check if test has written a result
+    if [ -f "$RESULT_FILE" ]; then
+        RESULT=$(cat "$RESULT_FILE")
+        echo ""
+        echo "=== Test Result: $RESULT ==="
+        cat ~/datahub_test.log 2>/dev/null | grep -E "PASS|FAIL|OPEN|CLOSED|HTTP|RESULT" || true
+        echo ""
+
+        # qdel both jobs
+        echo "Deleting server job $SERVER_JOBID ..."
+        qdel "$SERVER_JOBID" 2>/dev/null && echo "  Deleted." || echo "  Already finished."
+        echo "Deleting test job $TEST_JOBID ..."
+        qdel "$TEST_JOBID" 2>/dev/null && echo "  Deleted." || echo "  Already finished."
+
+        if [ "$RESULT" = "pass" ] || [ "$RESULT" = "partial" ]; then
+            echo ""
+            echo "SUCCESS: DataHub port connectivity verified across compute nodes."
+            exit 0
+        else
+            echo "FAILURE: DataHub ports not reachable."
+            exit 1
+        fi
+    fi
+
+    # Print periodic status
+    if (( ELAPSED % 60 == 0 )); then
+        echo -n "  [${ELAPSED}s] Jobs: "
+        qstat "$SERVER_JOBID" "$TEST_JOBID" 2>/dev/null | \
+            awk 'NR>2{printf "%s(%s) ", $1, $5}' || echo "(finished)"
+        echo ""
+    fi
+done
+
+echo "TIMEOUT: monitoring exceeded ${TIMEOUT}s — deleting jobs."
+qdel "$SERVER_JOBID" "$TEST_JOBID" 2>/dev/null || true
+exit 1

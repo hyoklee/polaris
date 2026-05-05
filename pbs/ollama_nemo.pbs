@@ -1,0 +1,41 @@
+#!/bin/bash
+#PBS -N ollama_nemo
+#PBS -A gpu_hack
+#PBS -q gpu_hack
+#PBS -l select=1:ncpus=6
+#PBS -l walltime=00:12:00
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/ollama.log
+export https_proxy=http://proxy.alcf.anl.gov:3128
+set -e
+
+MODEL=nemotron-3-nano
+
+# Start ollama server
+ollama serve &
+OLLAMA_PID=$!
+
+# Wait for server to be ready
+echo "Waiting for ollama server..."
+for i in $(seq 1 30); do
+    ollama list >/dev/null 2>&1 && break
+    sleep 1
+done
+
+# Pull model only if not already present
+if ollama list | grep -q "^${MODEL}"; then
+    echo "Model ${MODEL} already available — skipping download."
+else
+    echo "Model ${MODEL} not found — downloading..."
+    ollama pull ${MODEL}
+fi
+
+# Test the model with a simple prompt
+echo ""
+echo "=== Model test ==="
+echo "What is HDF5?" | ollama run ${MODEL}
+
+echo ""
+echo "=== Done ==="
+wait $OLLAMA_PID

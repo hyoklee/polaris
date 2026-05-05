@@ -1,0 +1,127 @@
+#!/bin/bash
+#PBS -N miv_opt_7e
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=03:00:00
+#PBS -q preemptable
+#PBS -A gpu_hack
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_opt_7e_test.log
+
+# MiV-Simulator 7-optimization experiment on Polaris
+# Case: https://github.com/GazzolaLab/MiV-Simulator-Cases/tree/main/7-optimization
+# Runs optimize-network with 1 iteration to validate the pipeline end-to-end.
+
+set -uo pipefail
+
+CASE_DIR=/lus/grand/projects/gpu_hack/iowarp/miv_opt_case
+VENV=/lus/grand/projects/gpu_hack/iowarp/miv_polaris/venv
+NVIDIA_HDF5=/opt/cray/pe/hdf5-parallel/1.14.3.7/nvidia/23.3
+NVIDIA_MPICH=/opt/cray/pe/mpich/9.0.1/ofi/nvidia/23.3
+NVHPC_LIB=/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/compilers/lib
+WIKI=/home/hyoklee/NeuroFAIR/wiki
+
+export LD_LIBRARY_PATH=$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-}
+export MPI_LIB_NRN_PATH=$NVIDIA_MPICH/lib/libmpi_nvidia.so
+export MIV_SKIP_MPI_CHECK=1
+export OPENBLAS_NUM_THREADS=1
+export NEUROH5_CHUNK_SIZE=65536
+
+source $VENV/bin/activate
+
+echo "==== MiV-Simulator 7-optimization on Polaris ===="
+echo "Date:    $(date)"
+echo "Job:     $PBS_JOBID"
+echo "Node:    $(cat $PBS_NODEFILE | sort -u | tr '\n' ' ')"
+echo "Python:  $(python3 --version)"
+echo "Case:    $CASE_DIR"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] GPU check
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [1] GPU check ==="
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 | head -4
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] Ensure clean mechanism state
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [2] Mechanism pre-check ==="
+cd $CASE_DIR
+# Do NOT run nrnivmodl here: NEURON auto-loads x86_64/libnrnmech.so from the
+# current directory at startup, which would cause 'VecStim already defined'
+# when optimize-network's compile_and_load tries to load the same mechanisms.
+# Let optimize-network's compile_and_load handle compilation and loading.
+ls $CASE_DIR/mechanisms/ | head -5
+echo "mechanisms directory ready (compile_and_load will build on first run)"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [3] Import check
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [3] Import / setup check ==="
+python3 -c "
+import os, sys
+sys.path.insert(0, '$CASE_DIR')
+checks = {
+    'mpi4py': lambda: __import__('mpi4py').__version__,
+    'neuroh5': lambda: 'ok',
+    'neuron': lambda: __import__('neuron').__version__,
+    'dmosopt': lambda: __import__('dmosopt').__version__ if hasattr(__import__('dmosopt'),'__version__') else 'ok',
+    'machinable': lambda: 'ok',
+    'miv_simulator': lambda: 'ok',
+}
+for name, fn in checks.items():
+    try:
+        print(f'  OK  {name}: {fn()}')
+    except Exception as e:
+        print(f'  FAIL {name}: {e}')
+" 2>&1 | grep -v "DISPLAY\|No graphics\|libmpi\|MPI_LIB\|numprocs"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [4] Run optimize-network (1 iteration, 1 generation, 1 worker)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [4] optimize-network (1 iter, 1 gen, test run) ==="
+cd $CASE_DIR
+
+# Use mpiexec from PALS with NVIDIA MPICH; 2 ranks: 1 controller + 1 worker
+# nprocs-per-worker=1 for quick test, n-iter=1, num-generations=1
+mpiexec -n 2 --ppn 2 \
+    --env LD_LIBRARY_PATH=$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-} \
+    --env MIV_SKIP_MPI_CHECK=1 \
+    --env OPENBLAS_NUM_THREADS=1 \
+    --env NEUROH5_CHUNK_SIZE=65536 \
+    --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH \
+    --env PYTHONPATH=$CASE_DIR:${PYTHONPATH:-} \
+    optimize-network \
+    --config-path=$CASE_DIR/config/optimize_network.yaml \
+    --optimize-file-dir=$CASE_DIR/results/network \
+    --verbose \
+    --nprocs-per-worker=1 \
+    --n-iter=1 \
+    --num-generations=1 \
+    --no_cleanup \
+    --dataset_prefix=$CASE_DIR/datasets \
+    --config_prefix=$CASE_DIR/config \
+    --results-path=$CASE_DIR/results/network \
+    --template-paths=$CASE_DIR/templates \
+    --spike_input_path=$CASE_DIR/datasets/Microcircuit_Small/Microcircuit_Small_input_spikes.h5 \
+    --spike_input_namespace='Input Spikes' \
+    --spike_input_attr='Spike Train' \
+    --io_size=1 \
+    2>&1 | tee $CASE_DIR/results/optimize_run.log
+echo "optimize-network exit: $?"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [5] Check results
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [5] Results ==="
+ls -la $CASE_DIR/results/network/ 2>/dev/null || echo "No results directory"
+echo ""
+
+echo "==== Done ===="
+echo "Date: $(date)"
+echo "Log:  $CASE_DIR/results/optimize_run.log"

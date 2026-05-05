@@ -1,0 +1,305 @@
+#!/bin/bash
+#PBS -N miv_io_fixed_test
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=00:30:00
+#PBS -q debug
+#PBS -A gpu_hack
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_io_fixed_test.log
+
+# MiV-Simulator + neuroh5 test on Polaris GPU compute node
+# Requires: ~/bin/miv_polaris_build.sh run first on login node
+#
+# Steps:
+#  [1] GPU / environment check
+#  [2] neuroh5 import check (MPI)
+#  [3] Parallel I/O tests (mpiexec -n 4)
+#  [4] miv-simulator pure Python unit tests (pytest)
+#  [5] CoreNEURON GPU backend probe
+
+# Note: do NOT use set -e — test failures should not abort the job
+set -uo pipefail
+
+WORKDIR=/lus/grand/projects/gpu_hack/iowarp/miv_polaris
+VENV=$WORKDIR/venv
+DATA=/lus/grand/projects/gpu_hack/iowarp/neuroh5
+MIV_SRC=/home/hyoklee/MiV-Simulator
+WIKI=/home/hyoklee/NeuroFAIR/wiki
+LOG=$WIKI/miv_io_fixed_test.log  # PBS -o redirects stdout here
+RESULTS=$WORKDIR/results
+mkdir -p $RESULTS
+
+# ── modules / library paths ──────────────────────────────────────────────────
+# mpi4py, neuroh5/io.so, and HDF5 all link libmpi_nvidia.so.12 (NVIDIA variant).
+# This eliminates the GNU Cray MPICH cray_common SHM process_vm_readv crash.
+NVIDIA_HDF5=/opt/cray/pe/hdf5-parallel/1.14.3.7/nvidia/23.3
+NVIDIA_MPICH=/opt/cray/pe/mpich/9.0.1/ofi/nvidia/23.3
+NVHPC_LIB=/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/compilers/lib
+export LD_LIBRARY_PATH=$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-}
+export MPI_LIB_NRN_PATH=$NVIDIA_MPICH/lib/libmpi_nvidia.so
+# PR #103: miv_simulator.__init__ now calls check_mpi_env() which raises for
+# non-parallel h5py.  On Polaris we use a serial h5py wheel (parallel build
+# fails due to numpy.distutils/msvccompiler incompatibility). Parallel I/O is
+# handled by neuroh5.io (C extension, links parallel HDF5 directly). Bypass.
+export MIV_SKIP_MPI_CHECK=1
+
+source $VENV/bin/activate
+
+NODES=$(cat $PBS_NODEFILE | sort -u | wc -l)
+echo "==== miv-simulator + neuroh5 test on Polaris ===="
+echo "Date:      $(date)"
+echo "Job:       $PBS_JOBID"
+echo "Nodes:     $NODES  ($(cat $PBS_NODEFILE | sort -u | tr '\n' ' '))"
+echo "Python:    $(which python3)  $(python3 --version)"
+echo "VENV:      $VENV"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] GPU check
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [1] GPU check ==="
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 | head -8
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] Import checks (single rank)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [2] Import checks ==="
+python3 -c "
+import sys
+checks = [
+    ('mpi4py',        lambda: __import__('mpi4py').__version__),
+    ('h5py',          lambda: __import__('h5py').__version__),
+    ('numpy',         lambda: __import__('numpy').__version__),
+    ('neuroh5',       lambda: 'ok'),
+    ('neuroh5.io',    lambda: str(dir(__import__('neuroh5.io', fromlist=['io']))[:3])),
+    ('miv_simulator', lambda: __import__('miv_simulator').__version__ if hasattr(__import__('miv_simulator'), '__version__') else 'ok'),
+    ('neuron',        lambda: __import__('neuron').__version__),
+]
+for name, fn in checks:
+    try:
+        print(f'  OK  {name}: {fn()}')
+    except Exception as e:
+        print(f'  FAIL {name}: {e}')
+" 2>&1
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [3] Parallel neuroh5 I/O tests (4 MPI ranks)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [3] Parallel neuroh5 I/O tests (4 ranks) ==="
+# neuroh5 alltoallv_vector uses MPI_Ialltoallv in CHUNK_SIZE chunks.
+# CMA crashes for large chunks (PYR ~160MB/rank).  NEUROH5_CHUNK_SIZE=65536
+# (64KB) keeps each alltoallv call in the POSIX-SHM eager window (<CMA thresh).
+mpiexec -n 4 --ppn 4 \
+    --env LD_LIBRARY_PATH=$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-} \
+    --env PYTHONPATH=${PYTHONPATH:-} \
+    --env MIV_SKIP_MPI_CHECK=1 \
+    --env NEUROH5_CHUNK_SIZE=65536 \
+    python3 /home/hyoklee/bin/miv_neuroh5_io_test.py \
+    2>&1 | tee $RESULTS/neuroh5_io_4ranks.txt
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [4a] miv-simulator: pure Python unit tests
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [4a] miv-simulator pure Python tests ==="
+# PR #103 fixes np.float_ → np.float64 in coding.py — test_coding.py now runnable
+cd $MIV_SRC
+python3 -m pytest -v --tb=short --no-header \
+    tests/test_coding.py \
+    tests/test_connections.py \
+    tests/test_input_features.py \
+    tests/test_distribute_synapses.py \
+    2>&1 | tee $RESULTS/pytest_pure_python.txt
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [4b] miv-simulator: eval_network and synapses tests
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [4b] miv-simulator eval_network + synapses tests ==="
+python3 -m pytest -v --tb=short --no-header \
+    tests/test_eval_network.py \
+    tests/test_synapses.py \
+    2>&1 | tee $RESULTS/pytest_eval_synapses.txt
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [5] CoreNEURON GPU backend probe
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [5] CoreNEURON GPU backend probe ==="
+python3 -c "
+try:
+    from neuron import h, coreneuron
+    print('  NEURON import OK')
+    print(f'  CoreNEURON: {coreneuron}')
+    has_gpu = hasattr(coreneuron, 'gpu')
+    print(f'  GPU attr present: {has_gpu}')
+    if has_gpu:
+        coreneuron.gpu = True
+        print(f'  GPU mode set: {coreneuron.gpu}')
+    else:
+        print('  GPU attr missing — CoreNEURON may be CPU-only wheel')
+except Exception as e:
+    print(f'  FAIL: {e}')
+" 2>&1
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [6] miv CLI tools check
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [6] MiV CLI tools ==="
+DATA_SMALL=$DATA/Microcircuit_Small/MiV_Cells_Microcircuit_Small_20220410.h5
+H5TYPES_FILE=$DATA/MiV_h5types.h5
+export OPENBLAS_NUM_THREADS=1
+export MPI_LIB_NRN_PATH=$NVIDIA_MPICH/lib/libmpi_nvidia.so
+
+mpiexec -n 1 --ppn 1 \
+    --env LD_LIBRARY_PATH=$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-} \
+    --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH \
+    --env OPENBLAS_NUM_THREADS=1 \
+    show-h5types --input-path $H5TYPES_FILE 2>&1 | grep -v "DISPLAY\|No graphics\|libmpi\|MPI_LIB"
+echo "---"
+mpiexec -n 2 --ppn 2 \
+    --env LD_LIBRARY_PATH=$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-} \
+    --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH \
+    --env OPENBLAS_NUM_THREADS=1 \
+    --env NEUROH5_CHUNK_SIZE=65536 \
+    query-cell-attrs \
+    --input-path $DATA_SMALL \
+    --populations PYR 2>&1 | grep -v "DISPLAY\|No graphics\|libmpi\|MPI_LIB" | head -20
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [7] Write wiki summary
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [7] Generating wiki summary ==="
+python3 - <<'PYSCRIPT'
+import os, datetime, subprocess
+
+wiki = "/home/hyoklee/NeuroFAIR/wiki"
+results_dir = "/lus/grand/projects/gpu_hack/iowarp/miv_polaris/results"
+
+def read_file(path, lines=None):
+    try:
+        with open(path) as f:
+            data = f.read()
+        if lines:
+            return "\n".join(data.splitlines()[:lines])
+        return data
+    except:
+        return "(file not found)"
+
+def last_n(text, n=30):
+    lines = text.strip().splitlines()
+    return "\n".join(lines[-n:])
+
+gpu_info = subprocess.getoutput("nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1")
+io_results = read_file(f"{results_dir}/neuroh5_io_4ranks.txt")
+pytest_pure = read_file(f"{results_dir}/pytest_pure_python.txt")
+pytest_eval = read_file(f"{results_dir}/pytest_eval_synapses.txt")
+
+date = datetime.date.today().isoformat()
+jobid = os.environ.get("PBS_JOBID", "unknown")
+
+doc = f"""# MiV-Simulator Build and Test on Polaris — PR #103 Patch
+
+**Date**: {date}
+**Platform**: Polaris (NVIDIA A100 GPU, Cray MPICH 9.0.1, NVHPC 25.5)
+**Job**: {jobid}
+**Source repo**: `~/MiV-Simulator` (GazzolaLab/MiV-Simulator + PR #103 patch)
+**PR #103**: https://github.com/GazzolaLab/MiV-Simulator/pull/103
+**neuroh5 source**: `~/neuroh5` (iraikov/neuroh5)
+**Data**: `/lus/grand/projects/gpu_hack/iowarp/neuroh5/`
+
+---
+
+## Build environment
+
+| Component | Version / Path |
+|---|---|
+| Python | 3.11.7 (cray-python venv w/ system-site-packages) |
+| cray-hdf5-parallel (build) | 1.14.3.7/gnu/12.3 (GNU variant, libmpi_gnu_123.so) |
+| cray-mpich (build) | 9.0.1/ofi/gnu/12.3 |
+| mpi4py | 3.1.4 (inherited from cray-python) |
+| numpy | 2.4.4 (pip wheel) |
+| h5py | 3.16.0 (serial wheel, MIV_SKIP_MPI_CHECK=1) |
+| NEURON | 9.0.1 (pip wheel) |
+| Venv | `/lus/grand/projects/gpu_hack/iowarp/miv_polaris/venv` |
+
+---
+
+## GPU Environment
+
+```
+{gpu_info}
+```
+
+---
+
+## Test Results
+
+### [3] Parallel neuroh5 I/O (4 MPI ranks)
+
+```
+{last_n(io_results, 40)}
+```
+
+### [4a] Pure Python unit tests (includes test_coding.py — fixed by PR #103)
+
+```
+{last_n(pytest_pure, 30)}
+```
+
+### [4b] eval_network + synapses tests
+
+```
+{last_n(pytest_eval, 30)}
+```
+
+---
+
+## PR #103 Changes Applied
+
+| File | Change |
+|---|---|
+| `src/miv_simulator/coding.py` | `np.float_` → `np.float64` (NumPy 2.0 fix) |
+| `src/miv_simulator/__init__.py` | Adds `check_mpi_env()` on import |
+| `src/miv_simulator/mpi_env.py` | New: validates mpicc, parallel h5py, mpi4py/h5py consistency |
+| `configure_mpi.py` | New: detects MPI/HDF5 build settings including Cray PE |
+| `_build_backend.py` | New: custom PEP 517 backend with MPI validation |
+| `tests/mechanisms/test_mechanisms.py` | Copies Gfluct3.mod; `dll_path` is now a directory |
+| `tests/mechanisms/test_gfluct3.py` | Adds `h.load_file("stdrun.hoc")`; rtol=1e-3 |
+| `pyproject.toml` | Requires h5py≥3.16, mpi4py≥4.0, neuron≥9.0, Python≥3.11 |
+
+## Notes
+
+- `MIV_SKIP_MPI_CHECK=1` required: h5py parallel build fails on Polaris (numpy.distutils
+  conflict with newer setuptools); serial h5py wheel used instead.
+  Parallel I/O handled by neuroh5.io (C extension, links libhdf5.so directly).
+- GNU Cray MPICH `cray_common` SHM transport bug: intra-node alltoallv still fails
+  (same as pre-patch; MPICH_SHM_BYPASS=1 not recognised by cray-mpich 9.0.1).
+
+---
+
+## Related files
+
+- [Full Polaris build/test report](miv_polaris_build_test.md)
+- Build script: `~/bin/miv_polaris_build.sh`
+- PBS script: `~/bin/miv_polaris_test.pbs`
+- Full job log: `~/NeuroFAIR/wiki/miv_pr103_test.log`
+- Raw results: `/lus/grand/projects/gpu_hack/iowarp/miv_polaris/results/`
+"""
+
+out = f"{wiki}/miv_pr103_polaris_test.md"
+with open(out, "w") as f:
+    f.write(doc)
+print(f"  Wiki saved: {out}")
+PYSCRIPT
+
+echo ""
+echo "==== Done ===="
+echo "Date: $(date)"
+echo "Results: $RESULTS/"
+echo "Wiki:    $WIKI/miv_pr103_polaris_test.md"

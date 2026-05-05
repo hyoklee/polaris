@@ -1,0 +1,153 @@
+#!/bin/bash
+#PBS -N miv_iowarp_build
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=03:00:00
+#PBS -q preemptable
+#PBS -A gpu_hack
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_iowarp_build_test.log
+
+# Build IOWarp Core (context-runtime + CTE) on Polaris using GCC.
+#
+# NVHPC (nvc++) cannot find <filesystem> without an explicit GCC-13 toolchain
+# path, which varies by Polaris allocation and is not reliably auto-detected.
+# The CTE/chimaera layer is CPU-only buffering code — GCC builds it cleanly
+# with native C++17 <filesystem> support and -fcoroutines for C++20 fibers.
+#
+# Installs to: /lus/grand/projects/gpu_hack/iowarp/iowarp-install/
+# Key outputs: chimaera (bin), libhermes_posix.so (lib), libwrp_cte_core.so (lib)
+
+set -uo pipefail
+
+IOWARP_SRC=/home/hyoklee/core.iowarp
+IOWARP_INSTALL=/lus/grand/projects/gpu_hack/iowarp/iowarp-install
+IOWARP_BUILD=$IOWARP_SRC/build-polaris
+
+NVIDIA_HDF5=/opt/cray/pe/hdf5-parallel/1.14.3.7/nvidia/23.3
+NVIDIA_MPICH=/opt/cray/pe/mpich/9.0.1/ofi/nvidia/23.3
+
+echo "==== IOWarp Core Build on Polaris ===="
+echo "Date: $(date)"
+echo "Job:  $PBS_JOBID"
+echo "Node: $(cat $PBS_NODEFILE | sort -u | tr '\n' ' ')"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] Select GCC >= 8 and compiler check
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [1] Compiler check ==="
+
+# Default 'g++' on Polaris nodes is GCC 7.5 (SUSE system symlink).
+# Versioned binaries /usr/bin/g++-13, g++-12, g++-14 are available directly.
+GCC_CXX=""
+GCC_CC=""
+for _ver in 12 13 14; do
+    if [ -x "/usr/bin/g++-${_ver}" ]; then
+        GCC_CXX="/usr/bin/g++-${_ver}"
+        GCC_CC="/usr/bin/gcc-${_ver}"
+        break
+    fi
+done
+if [ -z "$GCC_CXX" ]; then
+    echo "ERROR: no versioned g++ (g++-12/13/14) found in /usr/bin"
+    exit 1
+fi
+GCC_MAJOR=$($GCC_CXX -dumpversion | cut -d. -f1)
+echo "  g++: $($GCC_CXX --version | head -1) -> $GCC_CXX"
+echo "  gcc: $($GCC_CC  --version | head -1) -> $GCC_CC"
+echo "  mpicc:  $(${NVIDIA_MPICH}/bin/mpicc  --version 2>&1 | head -1)"
+echo "  mpicxx: $(${NVIDIA_MPICH}/bin/mpicxx --version 2>&1 | head -1)"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] Clean previous failed build and prepare install prefix
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [2] Prepare build directory ==="
+rm -rf $IOWARP_BUILD
+mkdir -p $IOWARP_BUILD
+mkdir -p $IOWARP_INSTALL
+echo "  Build dir: $IOWARP_BUILD (clean)"
+echo "  Install:   $IOWARP_INSTALL"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [3] CMake configure
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [3] CMake configure ==="
+cd $IOWARP_BUILD
+
+cmake $IOWARP_SRC \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=$IOWARP_INSTALL \
+    -DCMAKE_C_COMPILER=$GCC_CC \
+    -DCMAKE_CXX_COMPILER=$GCC_CXX \
+    -DWRP_CORE_ENABLE_RUNTIME=ON \
+    -DWRP_CORE_ENABLE_CTE=ON \
+    -DWRP_CORE_ENABLE_CAE=OFF \
+    -DWRP_CORE_ENABLE_CEE=OFF \
+    -DWRP_CORE_ENABLE_TESTS=OFF \
+    -DWRP_CORE_ENABLE_BENCHMARKS=OFF \
+    -DWRP_CORE_ENABLE_PYTHON=OFF \
+    -DWRP_CORE_ENABLE_MPI=ON \
+    -DWRP_CORE_ENABLE_HDF5=ON \
+    -DWRP_CORE_ENABLE_ZMQ=OFF \
+    -DWRP_CORE_ENABLE_IO_URING=ON \
+    -DWRP_CORE_ENABLE_ELF=ON \
+    -DWRP_CTE_ENABLE_POSIX_ADAPTER=ON \
+    -DWRP_CORE_ENABLE_RPATH=ON \
+    -DHSHM_LOG_LEVEL=1 \
+    -DMPI_C_COMPILER=$NVIDIA_MPICH/bin/mpicc \
+    -DMPI_CXX_COMPILER=$NVIDIA_MPICH/bin/mpicxx \
+    -DHDF5_ROOT=$NVIDIA_HDF5 \
+    2>&1
+CMAKE_RC=$?
+if [ $CMAKE_RC -ne 0 ]; then
+    echo "ERROR: cmake configure failed (exit $CMAKE_RC)"
+    exit $CMAKE_RC
+fi
+echo "  CMake configure: OK"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [4] Build and install
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [4] Build and install (j4, verbose on error) ==="
+T_BUILD_START=$(date +%s)
+make -j4 install 2>&1 || make -j1 install VERBOSE=1 2>&1
+BUILD_RC=$?
+T_BUILD_END=$(date +%s)
+echo "  Build elapsed: $(( T_BUILD_END - T_BUILD_START )) s"
+if [ $BUILD_RC -ne 0 ]; then
+    echo "ERROR: build failed (exit $BUILD_RC)"
+    exit $BUILD_RC
+fi
+echo "  Build: OK"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [5] Verify install
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [5] Verify install ==="
+echo "  Binaries:"
+ls -lh $IOWARP_INSTALL/bin/ 2>/dev/null || echo "  (no bin dir)"
+echo "  Libraries:"
+ls -lh $IOWARP_INSTALL/iowarp_core/lib/ $IOWARP_INSTALL/lib/ 2>/dev/null | grep -E "hermes|chimaera|wrp_cte" || echo "  (no key libs found)"
+echo ""
+
+CHIMAERA_BIN=$IOWARP_INSTALL/iowarp_core/bin/chimaera
+HERMES_POSIX=$IOWARP_INSTALL/lib/libwrp_cte_posix.so
+
+if [ -x "$CHIMAERA_BIN" ] && [ -f "$HERMES_POSIX" ]; then
+    echo "  chimaera:          OK  $(ls -lh $CHIMAERA_BIN | awk '{print $5}')"
+    echo "  libwrp_cte_posix:  OK  $(ls -lh $HERMES_POSIX | awk '{print $5}')"
+    echo ""
+    echo "==== Build SUCCESSFUL ===="
+    echo "  Next step: qsub ~/bin/miv_iowarp_bench.pbs"
+else
+    echo "  ERROR: key binaries missing after install"
+    [ -x "$CHIMAERA_BIN" ]  || echo "    chimaera:          MISSING"
+    [ -f "$HERMES_POSIX" ]  || echo "    libwrp_cte_posix:  MISSING"
+    exit 1
+fi
+echo "Date: $(date)"

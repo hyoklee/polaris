@@ -1,0 +1,31 @@
+#!/bin/bash
+# Submit PBS job to run ctest -D Experimental on ~/core.iowarp
+
+qsub -W block=true <<'PBS'
+#!/bin/bash
+#PBS -N core_ctest
+#PBS -A gpu_hack
+#PBS -q debug
+#PBS -l select=1:ncpus=32
+#PBS -l walltime=00:30:00
+#PBS -l filesystems=home
+#PBS -j oe
+#PBS -o /home/hyoklee/core_ctest.log
+
+# Source conda and activate build environment
+source /home/hyoklee/miniconda3/etc/profile.d/conda.sh
+conda activate base
+
+cd /home/hyoklee/core.iowarp
+
+# Configure cmake with site and build name for CDash
+cmake -B build -DSITE=polaris -DBUILDNAME=r/cnd
+
+# Run CTest experimental dashboard from build directory
+cd build
+ctest -D Experimental
+PBS
+
+# Submit results to CDash from login node (compute nodes lack outbound HTTPS)
+cd /home/hyoklee/core.iowarp/build
+ctest -D ExperimentalSubmit

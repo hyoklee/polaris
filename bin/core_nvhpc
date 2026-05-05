@@ -1,0 +1,63 @@
+#!/bin/bash
+# Submit PBS job to run ctest -D Experimental on ~/core.iowarp using NVHPC compiler
+
+qsub -W block=true <<'PBS'
+#!/bin/bash
+#PBS -N core_nvhpc_ctest
+#PBS -A gpu_hack
+#PBS -q debug
+#PBS -l select=1:ncpus=32
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home
+#PBS -j oe
+#PBS -o /home/hyoklee/core_nvhpc_ctest.log
+
+# Source conda and activate build environment
+source /home/hyoklee/miniconda3/etc/profile.d/conda.sh
+conda activate base
+
+NVHPC_BIN=/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/compilers/bin
+export NVLOCALRC=/home/hyoklee/nvhpc/localrc
+
+# HTTP proxy for outbound connectivity on Polaris compute nodes
+export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"
+export HTTPS_PROXY="http://proxy.alcf.anl.gov:3128"
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+
+cd /home/hyoklee/core.iowarp
+
+# Clean previous build to avoid stale CMakeCache
+rm -rf build_nvhpc
+
+# Configure cmake with NVHPC compilers, site and build name for CDash
+cmake -B build_nvhpc \
+    -DCMAKE_C_COMPILER=${NVHPC_BIN}/nvc \
+    -DCMAKE_CXX_COMPILER=${NVHPC_BIN}/nvc++ \
+    -DWRP_CORE_ENABLE_TESTS=ON \
+    -DSITE=polaris \
+    -DBUILDNAME=nvhpc/r/cnd
+
+# Build
+cmake --build build_nvhpc -j 32
+
+# Run tests and submit to CDash
+cd build_nvhpc
+
+# Diagnostic: run comutex test with verbose output
+echo "=== Comutex diagnostic run ===" | tee /home/hyoklee/comutex_diag.log
+ctest --output-on-failure -V -R cr_comutex_basic_tests --timeout 60 2>&1 | tee -a /home/hyoklee/comutex_diag.log
+echo "=== Comutex diagnostic done ===" | tee -a /home/hyoklee/comutex_diag.log
+
+# Diagnostic: run CTE functional pool creation test with verbose output
+echo "=== CTE functional diagnostic run ===" | tee /home/hyoklee/cte_diag.log
+ctest --output-on-failure -V -R cte_functional_pool_creation --timeout 30 2>&1 | tee -a /home/hyoklee/cte_diag.log
+echo "=== CTE functional diagnostic done ===" | tee -a /home/hyoklee/cte_diag.log
+
+# Full CDash submission (skip ExperimentalUpdate to avoid git reset)
+ctest -D ExperimentalStart
+ctest -D ExperimentalConfigure
+ctest -D ExperimentalBuild
+ctest -D ExperimentalTest
+ctest -D ExperimentalSubmit
+PBS

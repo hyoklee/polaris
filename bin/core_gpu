@@ -1,0 +1,51 @@
+#!/bin/bash
+# Submit PBS job to run ctest -D Experimental on ~/core.iowarp using CUDA
+
+qsub -W block=true <<'PBS'
+#!/bin/bash
+#PBS -N core_gpu_ctest
+#PBS -A gpu_hack
+#PBS -q debug
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home
+#PBS -j oe
+#PBS -o /home/hyoklee/core_gpu_ctest.log
+
+# Source conda and activate build environment
+source /home/hyoklee/miniconda3/etc/profile.d/conda.sh
+conda activate base
+
+export NVHPC_LOCALRC=/home/hyoklee/nvhpc/localrc
+export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/cuda/12.9/lib64:${LD_LIBRARY_PATH}
+
+# HTTP proxy for outbound connectivity on Polaris compute nodes
+export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"
+export HTTPS_PROXY="http://proxy.alcf.anl.gov:3128"
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+
+cd /home/hyoklee/core.iowarp
+
+# Clean previous build to avoid stale CMakeCache
+rm -rf build
+
+# Configure cmake with cuda_debug preset
+cmake --preset=cuda-debug \
+    -DCMAKE_C_COMPILER=gcc-14 \
+    -DCMAKE_CXX_COMPILER=g++-14 \
+    -DCMAKE_CUDA_HOST_COMPILER=g++-14 \
+    -DWRP_CORE_ENABLE_CAE=ON \
+    -DCAE_ENABLE_GLOBUS=ON \
+    -DSITE=polaris \
+    -DBUILDNAME=r/cnd/gpu
+
+# Build
+cmake --build build -j 
+
+# Run tests and submit to CDash
+cd build
+
+# Full CDash submission (skip ExperimentalUpdate to avoid git reset)
+ctest -D Experimental
+PBS

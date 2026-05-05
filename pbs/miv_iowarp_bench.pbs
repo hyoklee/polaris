@@ -1,0 +1,365 @@
+#!/bin/bash
+#PBS -N miv_iowarp_bench4
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=06:00:00
+#PBS -q preemptable
+#PBS -A gpu_hack
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_iowarp_bench4_test.log
+
+# MiV-Simulator + IOWarp Core CTE Performance Benchmark
+#
+# Compares I/O throughput and optimization wall time with/without
+# IOWarp Context Transfer Engine (CTE) RAM-tier buffering.
+#
+# Phase 1: Build IOWarp Core from ~/core.iowarp (once, cached in project space)
+# Phase 2: Baseline I/O test  — scatter_read_trees from Lustre
+# Phase 3: IOWarp I/O test    — scatter_read_trees via CTE RAM tier (2 runs)
+# Phase 4: Baseline optimize  — 1 iter × 1 gen × tstop=500ms
+# Phase 5: IOWarp optimize    — same with CTE LD_PRELOAD + Chimaera runtime
+
+set -uo pipefail
+
+# ─── paths ───────────────────────────────────────────────────────────────────
+CASE_DIR=/lus/grand/projects/gpu_hack/iowarp/miv_opt_case
+DATASET_DIR=$CASE_DIR/datasets
+VENV=/lus/grand/projects/gpu_hack/iowarp/miv_polaris/venv
+FOREST_DIR=/lus/grand/projects/gpu_hack/iowarp/neuroh5
+
+NVIDIA_HDF5=/opt/cray/pe/hdf5-parallel/1.14.3.7/nvidia/23.3
+NVIDIA_MPICH=/opt/cray/pe/mpich/9.0.1/ofi/nvidia/23.3
+NVHPC_LIB=/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/compilers/lib
+NVHPC_BIN=/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/compilers/bin
+
+# GCC-13 toolchain for NVHPC — resolve <filesystem> and C++20 stdlib headers
+# Probe Cray PE gcc module paths; override with GCC_PATH if module already loaded
+if [ -n "${GCC_PATH:-}" ] && [ -d "$GCC_PATH/bin" ]; then
+    GCC13_ROOT="$GCC_PATH"
+else
+    for _try in \
+        /opt/cray/pe/gcc/13.3.0/snos \
+        /opt/cray/pe/gcc/13.2.0/snos \
+        /opt/cray/pe/gcc/13.1.0/snos; do
+        if [ -x "$_try/bin/gcc" ]; then
+            GCC13_ROOT="$_try"
+            break
+        fi
+    done
+fi
+GCC13_ROOT="${GCC13_ROOT:-}"
+echo "GCC13_ROOT: ${GCC13_ROOT:-NOT FOUND}"
+
+IOWARP_SRC=/home/hyoklee/core.iowarp
+IOWARP_INSTALL=/lus/grand/projects/gpu_hack/iowarp/iowarp-install
+IOWARP_CONF=$CASE_DIR/config/cte_config.yaml
+IOWARP_LOG=$CASE_DIR/results/chimaera.log
+
+WIKI=/home/hyoklee/NeuroFAIR/wiki
+IO_TEST_SCRIPT=/home/hyoklee/bin/miv_neuroh5_io_test.py
+
+export LD_LIBRARY_PATH=$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-}
+export MPI_LIB_NRN_PATH=$NVIDIA_MPICH/lib/libmpi_nvidia.so
+export MIV_SKIP_MPI_CHECK=1
+export OPENBLAS_NUM_THREADS=1
+export NEUROH5_CHUNK_SIZE=65536
+
+source $VENV/bin/activate
+
+echo "==== MiV-Simulator + IOWarp CTE Benchmark ===="
+echo "Date:    $(date)"
+echo "Job:     $PBS_JOBID"
+echo "Node:    $(cat $PBS_NODEFILE | sort -u | tr '\n' ' ')"
+echo "Python:  $(python3 --version)"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] GPU check
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [1] GPU check ==="
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 | head -4
+echo "RAM: $(free -g | awk '/^Mem:/{print $2}') GB total"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] Pre-flight: verify IOWarp is installed (run miv_iowarp_build.pbs first)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [2] IOWarp pre-flight check ==="
+CHIMAERA_BIN=$IOWARP_INSTALL/iowarp_core/bin/chimaera
+HERMES_POSIX=$IOWARP_INSTALL/lib/libwrp_cte_posix.so
+
+if [ ! -x "$CHIMAERA_BIN" ] || [ ! -f "$HERMES_POSIX" ]; then
+    echo "ERROR: IOWarp not installed at $IOWARP_INSTALL"
+    echo "  chimaera:        $(ls $CHIMAERA_BIN 2>/dev/null || echo MISSING)"
+    echo "  libhermes_posix: $(ls $HERMES_POSIX 2>/dev/null || echo MISSING)"
+    echo "  Run first:  qsub ~/bin/miv_iowarp_build.pbs"
+    exit 1
+fi
+echo "  chimaera:         OK  $(ls -lh $CHIMAERA_BIN | awk '{print $5, $6, $7, $8}')"
+echo "  libhermes_posix:  OK  $(ls -lh $HERMES_POSIX | awk '{print $5, $6, $7, $8}')"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [3] Create CTE configuration (64 GB RAM tier on this node)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [3] CTE configuration ==="
+mkdir -p $CASE_DIR/config
+cat > $IOWARP_CONF << 'EOF'
+# IOWarp CTE config: single-node RAM tier for MiV neuroh5 HDF5 I/O buffering
+memory:
+  main_segment_size: 4294967296        # 4 GB
+  client_data_segment_size: 2147483648 # 2 GB
+  runtime_data_segment_size: 2147483648 # 2 GB
+
+networking:
+  port: 9413
+  neighborhood_size: 32
+
+runtime:
+  sched_threads: 8
+  slow_threads: 2
+  stack_size: 65536
+  queue_depth: 10000
+  local_sched: "default"
+
+compose:
+  - mod_name: wrp_cte_core
+    pool_name: wrp_cte
+    pool_query: local
+    pool_id: 512.0
+
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 60000
+
+    storage:
+      - path: "ram::cte_miv_storage"
+        bdev_type: "ram"
+        capacity_limit: "64GB"
+        score: 1.0
+EOF
+echo "  CTE config written to $IOWARP_CONF"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Timing helper
+# ─────────────────────────────────────────────────────────────────────────────
+elapsed() { echo $(( $2 - $1 )); }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [4] BASELINE I/O — scatter_read_trees (4 MPI ranks)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [4] BASELINE: scatter_read_trees (Lustre) ==="
+mkdir -p $CASE_DIR/results
+
+T_B_IO_START=$(date +%s)
+mpiexec -n 4 --ppn 4 \
+    --env LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
+    --env NEUROH5_CHUNK_SIZE=65536 \
+    --env PYTHONPATH=/home/hyoklee/bin:${PYTHONPATH:-} \
+    python3 $IO_TEST_SCRIPT \
+        --forest-dir $FOREST_DIR \
+        --dataset-dir $DATASET_DIR/Microcircuit_Small \
+        --only-trees \
+    2>&1 | tee $CASE_DIR/results/baseline_io.log
+T_B_IO_END=$(date +%s)
+B_IO_ELAPSED=$(elapsed $T_B_IO_START $T_B_IO_END)
+echo ""
+echo "  BASELINE I/O elapsed: ${B_IO_ELAPSED} s"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [5] Start Chimaera runtime (background)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [5] Starting Chimaera runtime ==="
+export CHI_SERVER_CONF=$IOWARP_CONF
+export PATH=$IOWARP_INSTALL/iowarp_core/bin:$PATH
+export LD_LIBRARY_PATH=$IOWARP_INSTALL/iowarp_core/lib:$IOWARP_INSTALL/lib:$LD_LIBRARY_PATH
+
+# Kill any stale chimaera process holding port 9413
+pkill -9 chimaera 2>/dev/null || true
+sleep 2
+
+$CHIMAERA_BIN runtime start > $IOWARP_LOG 2>&1 &
+CHIMAERA_PID=$!
+echo "  Chimaera PID: $CHIMAERA_PID"
+# Poll until ready (up to 30s)
+for i in $(seq 1 30); do
+    sleep 1
+    if ! kill -0 $CHIMAERA_PID 2>/dev/null; then
+        echo "  ERROR: Chimaera failed to start — check $IOWARP_LOG"
+        cat $IOWARP_LOG
+        break
+    fi
+    # Check if TCP server is up
+    ss -tlnp 2>/dev/null | grep -q ":9413" && echo "  Chimaera runtime running (port 9413 up)" && break
+done
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [6] IOWARP I/O — scatter_read_trees via CTE RAM tier (run twice)
+#     Run 1: stages data from Lustre → CTE RAM  (cold cache)
+#     Run 2: reads data from CTE RAM             (warm cache)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [6a] IOWARP I/O run 1 (cold cache — staging to RAM) ==="
+T_W_IO1_START=$(date +%s)
+mpiexec -n 4 --ppn 4 \
+    --env LD_LIBRARY_PATH=$IOWARP_INSTALL/iowarp_core/lib:$IOWARP_INSTALL/lib:$LD_LIBRARY_PATH \
+    --env CHI_SERVER_CONF=$IOWARP_CONF \
+    --env NEUROH5_CHUNK_SIZE=65536 \
+    --env PYTHONPATH=/home/hyoklee/bin:${PYTHONPATH:-} \
+    --env LD_PRELOAD=$HERMES_POSIX \
+    python3 $IO_TEST_SCRIPT \
+        --forest-dir $FOREST_DIR \
+        --dataset-dir $DATASET_DIR/Microcircuit_Small \
+        --only-trees \
+    2>&1 | tee $CASE_DIR/results/iowarp_io_cold.log
+T_W_IO1_END=$(date +%s)
+W_IO1_ELAPSED=$(elapsed $T_W_IO1_START $T_W_IO1_END)
+echo ""
+echo "  IOWARP I/O cold elapsed: ${W_IO1_ELAPSED} s"
+echo ""
+
+echo "=== [6b] IOWARP I/O run 2 (warm cache — reads from RAM) ==="
+T_W_IO2_START=$(date +%s)
+mpiexec -n 4 --ppn 4 \
+    --env LD_LIBRARY_PATH=$IOWARP_INSTALL/iowarp_core/lib:$IOWARP_INSTALL/lib:$LD_LIBRARY_PATH \
+    --env CHI_SERVER_CONF=$IOWARP_CONF \
+    --env NEUROH5_CHUNK_SIZE=65536 \
+    --env PYTHONPATH=/home/hyoklee/bin:${PYTHONPATH:-} \
+    --env LD_PRELOAD=$HERMES_POSIX \
+    python3 $IO_TEST_SCRIPT \
+        --forest-dir $FOREST_DIR \
+        --dataset-dir $DATASET_DIR/Microcircuit_Small \
+        --only-trees \
+    2>&1 | tee $CASE_DIR/results/iowarp_io_warm.log
+T_W_IO2_END=$(date +%s)
+W_IO2_ELAPSED=$(elapsed $T_W_IO2_START $T_W_IO2_END)
+echo ""
+echo "  IOWARP I/O warm elapsed: ${W_IO2_ELAPSED} s"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [7] BASELINE Optimization — 1 iter × 1 gen, tstop=500ms
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [7] BASELINE: optimize-network (Lustre, tstop=500ms) ==="
+cd $CASE_DIR
+
+# Clear existing results to ensure a fresh run
+rm -rf $CASE_DIR/results/baseline_network
+mkdir -p $CASE_DIR/results/baseline_network
+
+T_B_OPT_START=$(date +%s)
+mpiexec -n 2 --ppn 2 \
+    --env LD_LIBRARY_PATH=$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-} \
+    --env MIV_SKIP_MPI_CHECK=1 \
+    --env OPENBLAS_NUM_THREADS=1 \
+    --env NEUROH5_CHUNK_SIZE=65536 \
+    --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH \
+    --env PYTHONPATH=$CASE_DIR:${PYTHONPATH:-} \
+    optimize-network \
+    --config-path=$CASE_DIR/config/optimize_network.yaml \
+    --optimize-file-dir=$CASE_DIR/results/baseline_network \
+    --verbose \
+    --nprocs-per-worker=1 \
+    --n-epochs=1 \
+    --n-initial=2 \
+    --population-size=2 \
+    --num-generations=1 \
+    --no_cleanup \
+    --dataset_prefix=$CASE_DIR/datasets \
+    --config_prefix=$CASE_DIR/config \
+    --results-path=$CASE_DIR/results/baseline_network \
+    --template-paths=$CASE_DIR/templates \
+    --spike_input_path=$CASE_DIR/datasets/Microcircuit_Small/Microcircuit_Small_input_spikes.h5 \
+    --spike_input_namespace='Input Spikes' \
+    --spike_input_attr='Spike Train' \
+    --tstop=200 \
+    --io_size=1 \
+    2>&1 | tee $CASE_DIR/results/baseline_opt.log
+T_B_OPT_END=$(date +%s)
+B_OPT_ELAPSED=$(elapsed $T_B_OPT_START $T_B_OPT_END)
+echo ""
+echo "  BASELINE opt elapsed: ${B_OPT_ELAPSED} s"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [8] IOWARP Optimization — same config but with CTE LD_PRELOAD
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [8] IOWARP: optimize-network (CTE RAM tier, tstop=500ms) ==="
+cd $CASE_DIR
+
+rm -rf $CASE_DIR/results/iowarp_network
+mkdir -p $CASE_DIR/results/iowarp_network
+
+T_W_OPT_START=$(date +%s)
+mpiexec -n 2 --ppn 2 \
+    --env LD_LIBRARY_PATH=$IOWARP_INSTALL/iowarp_core/lib:$IOWARP_INSTALL/lib:$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-} \
+    --env CHI_SERVER_CONF=$IOWARP_CONF \
+    --env MIV_SKIP_MPI_CHECK=1 \
+    --env OPENBLAS_NUM_THREADS=1 \
+    --env NEUROH5_CHUNK_SIZE=65536 \
+    --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH \
+    --env PYTHONPATH=$CASE_DIR:${PYTHONPATH:-} \
+    --env LD_PRELOAD=$HERMES_POSIX \
+    optimize-network \
+    --config-path=$CASE_DIR/config/optimize_network.yaml \
+    --optimize-file-dir=$CASE_DIR/results/iowarp_network \
+    --verbose \
+    --nprocs-per-worker=1 \
+    --n-epochs=1 \
+    --n-initial=2 \
+    --population-size=2 \
+    --num-generations=1 \
+    --no_cleanup \
+    --dataset_prefix=$CASE_DIR/datasets \
+    --config_prefix=$CASE_DIR/config \
+    --results-path=$CASE_DIR/results/iowarp_network \
+    --template-paths=$CASE_DIR/templates \
+    --spike_input_path=$CASE_DIR/datasets/Microcircuit_Small/Microcircuit_Small_input_spikes.h5 \
+    --spike_input_namespace='Input Spikes' \
+    --spike_input_attr='Spike Train' \
+    --tstop=200 \
+    --io_size=1 \
+    2>&1 | tee $CASE_DIR/results/iowarp_opt.log
+T_W_OPT_END=$(date +%s)
+W_OPT_ELAPSED=$(elapsed $T_W_OPT_START $T_W_OPT_END)
+echo ""
+echo "  IOWARP opt elapsed: ${W_OPT_ELAPSED} s"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [9] Shutdown Chimaera runtime
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [9] Shutdown Chimaera runtime ==="
+if kill -0 $CHIMAERA_PID 2>/dev/null; then
+    $CHIMAERA_BIN runtime stop 2>/dev/null || kill $CHIMAERA_PID
+    echo "  Chimaera stopped"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [10] Performance summary
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [10] Performance Summary ==="
+echo ""
+echo "  --- I/O: scatter_read_trees (incl. PYR_forest_compressed.h5) ---"
+echo "  Baseline (Lustre):          ${B_IO_ELAPSED} s"
+echo "  IOWarp CTE cold (staging):  ${W_IO1_ELAPSED} s"
+echo "  IOWarp CTE warm (from RAM): ${W_IO2_ELAPSED} s"
+if [ "$W_IO2_ELAPSED" -gt 0 ] && [ "$B_IO_ELAPSED" -gt 0 ]; then
+    IO_SPEEDUP=$(echo "scale=2; $B_IO_ELAPSED / $W_IO2_ELAPSED" | bc 2>/dev/null || echo "N/A")
+    echo "  I/O speedup (warm/baseline): ${IO_SPEEDUP}x"
+fi
+echo ""
+echo "  --- Optimization: 1 epoch × 2 initial × tstop=200ms ---"
+echo "  Baseline (Lustre):    ${B_OPT_ELAPSED} s"
+echo "  IOWarp CTE (LD_PRELOAD): ${W_OPT_ELAPSED} s"
+if [ "$W_OPT_ELAPSED" -gt 0 ] && [ "$B_OPT_ELAPSED" -gt 0 ]; then
+    OPT_SPEEDUP=$(echo "scale=2; $B_OPT_ELAPSED / $W_OPT_ELAPSED" | bc 2>/dev/null || echo "N/A")
+    echo "  Opt speedup: ${OPT_SPEEDUP}x"
+fi
+echo ""
+echo "==== Done ===="
+echo "Date: $(date)"
+echo "Logs: $CASE_DIR/results/"
