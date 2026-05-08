@@ -1,0 +1,132 @@
+#!/bin/bash
+#PBS -N clio_core_polaris
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=01:00:00
+#PBS -q debug
+#PBS -A gpu_hack
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/clio_core_polaris.log
+
+# Build ~/clio-core with the polaris preset (GCC-14, CUDA A100, BaM, GPU Runtime)
+# and run ctest -D Experimental to report to my.cdash.org/HERMES
+
+set -uo pipefail
+
+export PATH=/home/hyoklee/miniconda3/bin:$PATH
+
+CUDA_LIB=/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/cuda/12.9/targets/x86_64-linux/lib
+export LD_LIBRARY_PATH=${CUDA_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export LIBRARY_PATH=${CUDA_LIB}${LIBRARY_PATH:+:$LIBRARY_PATH}
+
+CLIO_SRC=/home/hyoklee/clio-core
+CLIO_BUILD=/lus/grand/projects/gpu_hack/hyoklee/clio-core/build-polaris
+GCC_CC=/usr/bin/gcc-14
+GCC_CXX=/usr/bin/g++-14
+CUDA_HOST_CXX=/usr/bin/g++-12
+
+echo "==== clio-core Polaris Build+Test ===="
+echo "Date:   $(date)"
+echo "Job:    $PBS_JOBID"
+echo "Node:   $(cat $PBS_NODEFILE | sort -u | tr '\n' ' ')"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] Compiler check
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [1] Compiler check ==="
+if [ ! -x "$GCC_CXX" ] || [ ! -x "$GCC_CC" ]; then
+    echo "ERROR: gcc-14/g++-14 not found in /usr/bin"
+    exit 1
+fi
+if [ ! -x "$CUDA_HOST_CXX" ]; then
+    echo "ERROR: g++-12 not found in /usr/bin (required as CUDA host compiler)"
+    exit 1
+fi
+echo "  g++:           $($GCC_CXX --version | head -1)"
+echo "  gcc:           $($GCC_CC  --version | head -1)"
+echo "  cuda host g++: $($CUDA_HOST_CXX --version | head -1)"
+echo "  nvcc:          $(/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/compilers/bin/nvcc --version | grep 'release')"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] Clean build directory
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [2] Prepare build directory ==="
+rm -rf $CLIO_BUILD
+mkdir -p $CLIO_BUILD
+echo "  Build dir: $CLIO_BUILD (clean)"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [3] CMake configure
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [3] CMake configure ==="
+cd $CLIO_BUILD
+
+export CUDAHOSTCXX=$CUDA_HOST_CXX
+
+cmake $CLIO_SRC \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_COMPILER=$GCC_CC \
+    -DCMAKE_CXX_COMPILER=$GCC_CXX \
+    -DCMAKE_CUDA_HOST_COMPILER=$CUDA_HOST_CXX \
+    -DWRP_CORE_ENABLE_RUNTIME=ON \
+    -DWRP_CORE_ENABLE_CTE=ON \
+    -DWRP_CORE_ENABLE_CAE=ON \
+    -DWRP_CORE_ENABLE_CEE=ON \
+    -DWRP_CORE_ENABLE_TESTS=ON \
+    -DWRP_CORE_ENABLE_BENCHMARKS=ON \
+    -DWRP_CORE_ENABLE_ELF=OFF \
+    -DWRP_CORE_ENABLE_CUDA=ON \
+    -DWRP_CORE_ENABLE_GPU_RUNTIME=ON \
+    -DWRP_CORE_ENABLE_BAM=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=80 \
+    -DCMAKE_CUDA_STANDARD=17 \
+    -DWRP_CORE_ENABLE_IO_URING=ON \
+    -DWRP_CORE_ENABLE_DOCKER_CI=OFF \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DHSHM_LOG_LEVEL=1 \
+    -DSITE=polaris \
+    -DBUILDNAME=d/gpu/bam/nig \
+    2>&1
+CMAKE_RC=$?
+if [ $CMAKE_RC -ne 0 ]; then
+    echo "ERROR: cmake configure failed (exit $CMAKE_RC)"
+    exit $CMAKE_RC
+fi
+echo "  CMake configure: OK"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [4] Build
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [4] Build (j4) ==="
+T_BUILD_START=$(date +%s)
+make -j4 2>&1 || make -j1 VERBOSE=1 2>&1
+BUILD_RC=$?
+T_BUILD_END=$(date +%s)
+echo "  Build elapsed: $(( T_BUILD_END - T_BUILD_START )) s"
+if [ $BUILD_RC -ne 0 ]; then
+    echo "ERROR: build failed (exit $BUILD_RC)"
+    exit $BUILD_RC
+fi
+echo "  Build: OK"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [5] ctest -D Experimental (build + test + submit to CDash)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [5] ctest -D Experimental ==="
+
+export http_proxy=http://proxy.alcf.anl.gov:3128
+export https_proxy=http://proxy.alcf.anl.gov:3128
+
+ctest -D Experimental -j4 2>&1
+CTEST_RC=$?
+
+echo ""
+echo "  ctest exit: $CTEST_RC"
+echo "  Results: https://my.cdash.org/index.php?project=HERMES"
+echo "==== Done ===="
+echo "Date: $(date)"
