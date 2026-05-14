@@ -1,12 +1,12 @@
 #!/bin/bash
-#PBS -N miv_iowarp_bench4
+#PBS -N miv_iowarp_bench5
 #PBS -l select=1:ncpus=32:ngpus=4
 #PBS -l walltime=06:00:00
 #PBS -q preemptable
 #PBS -A gpu_hack
 #PBS -l filesystems=home:grand
 #PBS -j oe
-#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_iowarp_bench4_test.log
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_iowarp_bench5_test.log
 
 # MiV-Simulator + IOWarp Core CTE Performance Benchmark
 #
@@ -104,7 +104,18 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== [3] CTE configuration ==="
 mkdir -p $CASE_DIR/config
-cat > $IOWARP_CONF << 'EOF'
+
+# Get actual node IP — avoids 127.0.0.1 which may have port conflicts
+NODE_IP=$(hostname -I | awk '{print $1}')
+[ -z "$NODE_IP" ] && NODE_IP=$(python3 -c "import socket; print(socket.gethostbyname(socket.gethostname()))")
+
+# Pick a free port dynamically — avoids TIME_WAIT/occupied port issues on 9413
+CHI_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)")
+CHI_HOSTFILE=/tmp/chi_hostfile_${PBS_JOBID}
+echo "$NODE_IP" > $CHI_HOSTFILE
+echo "  Node IP: $NODE_IP  Port: $CHI_PORT  Hostfile: $CHI_HOSTFILE"
+
+cat > $IOWARP_CONF << EOF
 # IOWarp CTE config: single-node RAM tier for MiV neuroh5 HDF5 I/O buffering
 memory:
   main_segment_size: 4294967296        # 4 GB
@@ -112,8 +123,9 @@ memory:
   runtime_data_segment_size: 2147483648 # 2 GB
 
 networking:
-  port: 9413
+  port: ${CHI_PORT}
   neighborhood_size: 32
+  hostfile: "${CHI_HOSTFILE}"
 
 runtime:
   sched_threads: 8
@@ -173,16 +185,19 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== [5] Starting Chimaera runtime ==="
 export CHI_SERVER_CONF=$IOWARP_CONF
+export CHI_SERVER_ADDR=$NODE_IP
+export CHI_PORT=$CHI_PORT
 export PATH=$IOWARP_INSTALL/iowarp_core/bin:$PATH
 export LD_LIBRARY_PATH=$IOWARP_INSTALL/iowarp_core/lib:$IOWARP_INSTALL/lib:$LD_LIBRARY_PATH
 
-# Kill any stale chimaera process holding port 9413
+# Kill any stale chimaera process
 pkill -9 chimaera 2>/dev/null || true
 sleep 2
 
+CHIMAERA_OK=0
 $CHIMAERA_BIN runtime start > $IOWARP_LOG 2>&1 &
 CHIMAERA_PID=$!
-echo "  Chimaera PID: $CHIMAERA_PID"
+echo "  Chimaera PID: $CHIMAERA_PID  (addr=$NODE_IP port=$CHI_PORT)"
 # Poll until ready (up to 30s)
 for i in $(seq 1 30); do
     sleep 1
@@ -191,8 +206,11 @@ for i in $(seq 1 30); do
         cat $IOWARP_LOG
         break
     fi
-    # Check if TCP server is up
-    ss -tlnp 2>/dev/null | grep -q ":9413" && echo "  Chimaera runtime running (port 9413 up)" && break
+    if ss -tlnp 2>/dev/null | grep -q ":${CHI_PORT}"; then
+        echo "  Chimaera runtime running (port ${CHI_PORT} up)"
+        CHIMAERA_OK=1
+        break
+    fi
 done
 echo ""
 
@@ -201,11 +219,15 @@ echo ""
 #     Run 1: stages data from Lustre → CTE RAM  (cold cache)
 #     Run 2: reads data from CTE RAM             (warm cache)
 # ─────────────────────────────────────────────────────────────────────────────
+if [ "$CHIMAERA_OK" -eq 1 ]; then
+
 echo "=== [6a] IOWARP I/O run 1 (cold cache — staging to RAM) ==="
 T_W_IO1_START=$(date +%s)
 mpiexec -n 4 --ppn 4 \
     --env LD_LIBRARY_PATH=$IOWARP_INSTALL/iowarp_core/lib:$IOWARP_INSTALL/lib:$LD_LIBRARY_PATH \
     --env CHI_SERVER_CONF=$IOWARP_CONF \
+    --env CHI_SERVER_ADDR=$NODE_IP \
+    --env CHI_PORT=$CHI_PORT \
     --env NEUROH5_CHUNK_SIZE=65536 \
     --env PYTHONPATH=/home/hyoklee/bin:${PYTHONPATH:-} \
     --env LD_PRELOAD=$HERMES_POSIX \
@@ -225,6 +247,8 @@ T_W_IO2_START=$(date +%s)
 mpiexec -n 4 --ppn 4 \
     --env LD_LIBRARY_PATH=$IOWARP_INSTALL/iowarp_core/lib:$IOWARP_INSTALL/lib:$LD_LIBRARY_PATH \
     --env CHI_SERVER_CONF=$IOWARP_CONF \
+    --env CHI_SERVER_ADDR=$NODE_IP \
+    --env CHI_PORT=$CHI_PORT \
     --env NEUROH5_CHUNK_SIZE=65536 \
     --env PYTHONPATH=/home/hyoklee/bin:${PYTHONPATH:-} \
     --env LD_PRELOAD=$HERMES_POSIX \
@@ -238,6 +262,12 @@ W_IO2_ELAPSED=$(elapsed $T_W_IO2_START $T_W_IO2_END)
 echo ""
 echo "  IOWARP I/O warm elapsed: ${W_IO2_ELAPSED} s"
 echo ""
+
+else
+    echo "  SKIPPING IOWarp I/O tests — Chimaera did not start"
+    W_IO1_ELAPSED=0
+    W_IO2_ELAPSED=0
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [7] BASELINE Optimization — 1 iter × 1 gen, tstop=500ms
@@ -272,7 +302,7 @@ mpiexec -n 2 --ppn 2 \
     --results-path=$CASE_DIR/results/baseline_network \
     --template-paths=$CASE_DIR/templates \
     --spike_input_path=$CASE_DIR/datasets/Microcircuit_Small/Microcircuit_Small_input_spikes.h5 \
-    --spike_input_namespace='Input Spikes' \
+    --spike_input_namespace='Input Spikes A Diag' \
     --spike_input_attr='Spike Train' \
     --tstop=200 \
     --io_size=1 \
@@ -286,6 +316,7 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 # [8] IOWARP Optimization — same config but with CTE LD_PRELOAD
 # ─────────────────────────────────────────────────────────────────────────────
+if [ "$CHIMAERA_OK" -eq 1 ]; then
 echo "=== [8] IOWARP: optimize-network (CTE RAM tier, tstop=500ms) ==="
 cd $CASE_DIR
 
@@ -296,6 +327,8 @@ T_W_OPT_START=$(date +%s)
 mpiexec -n 2 --ppn 2 \
     --env LD_LIBRARY_PATH=$IOWARP_INSTALL/iowarp_core/lib:$IOWARP_INSTALL/lib:$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-} \
     --env CHI_SERVER_CONF=$IOWARP_CONF \
+    --env CHI_SERVER_ADDR=$NODE_IP \
+    --env CHI_PORT=$CHI_PORT \
     --env MIV_SKIP_MPI_CHECK=1 \
     --env OPENBLAS_NUM_THREADS=1 \
     --env NEUROH5_CHUNK_SIZE=65536 \
@@ -317,7 +350,7 @@ mpiexec -n 2 --ppn 2 \
     --results-path=$CASE_DIR/results/iowarp_network \
     --template-paths=$CASE_DIR/templates \
     --spike_input_path=$CASE_DIR/datasets/Microcircuit_Small/Microcircuit_Small_input_spikes.h5 \
-    --spike_input_namespace='Input Spikes' \
+    --spike_input_namespace='Input Spikes A Diag' \
     --spike_input_attr='Spike Train' \
     --tstop=200 \
     --io_size=1 \
@@ -327,6 +360,11 @@ W_OPT_ELAPSED=$(elapsed $T_W_OPT_START $T_W_OPT_END)
 echo ""
 echo "  IOWARP opt elapsed: ${W_OPT_ELAPSED} s"
 echo ""
+
+else
+    echo "  SKIPPING IOWarp optimization — Chimaera did not start"
+    W_OPT_ELAPSED=0
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [9] Shutdown Chimaera runtime
