@@ -1,12 +1,12 @@
 #!/bin/bash
-#PBS -N miv_iowarp_bench5
+#PBS -N miv_iowarp_bench6
 #PBS -l select=1:ncpus=32:ngpus=4
-#PBS -l walltime=01:00:00
-#PBS -q debug
+#PBS -l walltime=06:00:00
+#PBS -q preemptable
 #PBS -A gpu_hack
 #PBS -l filesystems=home:grand
 #PBS -j oe
-#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_iowarp_bench5_test.log
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_iowarp_bench6_test.log
 
 # MiV-Simulator + IOWarp Core CTE Performance Benchmark
 #
@@ -105,10 +105,26 @@ echo ""
 echo "=== [3] CTE configuration ==="
 mkdir -p $CASE_DIR/config
 
-# Resolve node hostname from PBS nodefile — gives the HSN/Slingshot IP
+# Collect ALL node IPs to try for Chimaera (management + Slingshot HSN)
+# Management IP (10.201.x.x) cannot bind ZMQ on Polaris; Slingshot may work.
 NODE_HOST=$(head -1 $PBS_NODEFILE)
-NODE_IP=$(python3 -c "import socket; print(socket.gethostbyname('${NODE_HOST}'))" 2>/dev/null || hostname -I | awk '{print $1}')
-echo "  Node host: $NODE_HOST  IP: $NODE_IP"
+NODE_IPS=$(python3 -c "
+import socket
+ips = []
+# HSN/Slingshot IP via hostname resolution
+try: ips.append(socket.gethostbyname('${NODE_HOST}'))
+except: pass
+# All IPs from hostname -I (management, HSN, etc.)
+import subprocess
+r = subprocess.run(['hostname','-I'], capture_output=True, text=True)
+for ip in r.stdout.split():
+    if ip not in ips:
+        ips.append(ip)
+print(' '.join(ips))
+" 2>/dev/null)
+NODE_IP=$(echo $NODE_IPS | awk '{print $1}')
+echo "  Node host: $NODE_HOST"
+echo "  All IPs: $NODE_IPS"
 
 # Pick a free port in 10000-30000 (below Linux ephemeral range 32768-60999)
 # and verify it is bindable on the specific node IP to avoid ZMQ bind failure.
@@ -211,53 +227,51 @@ pkill -9 chimaera 2>/dev/null || true
 sleep 2
 
 CHIMAERA_OK=0
-for CHI_ATTEMPT in $(seq 1 5); do
-    # On retry: pick a new port verified free on the node IP
-    if [ "$CHI_ATTEMPT" -gt 1 ]; then
+CHI_ATTEMPT=0
+# Try each node IP (HSN, management, etc.) × 3 port attempts each
+for TRY_IP in $NODE_IPS; do
+    [ "$CHIMAERA_OK" -eq 1 ] && break
+    for _P in 1 2 3; do
+        CHI_ATTEMPT=$((CHI_ATTEMPT + 1))
         CHI_PORT=$(python3 -c "
 import socket, random
-node_ip = '${NODE_IP}'
 for _ in range(200):
     p = random.randint(10000, 30000)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((node_ip, p))
+        s.bind(('${TRY_IP}', p))
         s.close()
         print(p)
         break
     except OSError:
         pass
-")
+" 2>/dev/null)
+        [ -z "$CHI_PORT" ] && continue
+        echo "$TRY_IP" > $CHI_HOSTFILE
         sed -i "s/^  port: .*/  port: ${CHI_PORT}/" $IOWARP_CONF
-        export CHI_PORT
-        echo "  Retry $CHI_ATTEMPT with port $CHI_PORT"
-    fi
-
-    pkill -9 chimaera 2>/dev/null || true
-    sleep 1
-    $CHIMAERA_BIN runtime start > $IOWARP_LOG 2>&1 &
-    CHIMAERA_PID=$!
-    echo "  Chimaera PID: $CHIMAERA_PID  (addr=$NODE_IP port=$CHI_PORT attempt=$CHI_ATTEMPT)"
-
-    for i in $(seq 1 15); do
-        sleep 1
-        if ! kill -0 $CHIMAERA_PID 2>/dev/null; then
-            echo "  Chimaera exited on attempt $CHI_ATTEMPT port $CHI_PORT"
-            break
-        fi
-        if ss -tlnp 2>/dev/null | grep -q ":${CHI_PORT}"; then
-            echo "  Chimaera running (port ${CHI_PORT} up after ${i}s)"
-            CHIMAERA_OK=1
-            break
-        fi
+        export CHI_SERVER_ADDR=$TRY_IP CHI_PORT
+        pkill -9 chimaera 2>/dev/null || true; sleep 1
+        $CHIMAERA_BIN runtime start > $IOWARP_LOG 2>&1 &
+        CHIMAERA_PID=$!
+        echo "  Chimaera PID: $CHIMAERA_PID  (addr=$TRY_IP port=$CHI_PORT attempt=$CHI_ATTEMPT)"
+        for i in $(seq 1 15); do
+            sleep 1
+            if ! kill -0 $CHIMAERA_PID 2>/dev/null; then
+                echo "  Chimaera exited on attempt $CHI_ATTEMPT (addr=$TRY_IP port=$CHI_PORT)"
+                break
+            fi
+            if ss -tlnp 2>/dev/null | grep -q ":${CHI_PORT}"; then
+                echo "  Chimaera running (port ${CHI_PORT} up after ${i}s)"
+                NODE_IP=$TRY_IP; CHIMAERA_OK=1; break
+            fi
+        done
+        [ "$CHIMAERA_OK" -eq 1 ] && break
     done
-
-    [ "$CHIMAERA_OK" -eq 1 ] && break
 done
 
 if [ "$CHIMAERA_OK" -eq 0 ]; then
-    echo "  ERROR: Chimaera failed after 5 attempts — last log:"
+    echo "  ERROR: Chimaera failed on all IPs/ports — last log:"
     cat $IOWARP_LOG
 fi
 echo ""
