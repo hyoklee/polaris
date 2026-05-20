@@ -1,0 +1,86 @@
+#!/bin/bash
+#PBS -N vfd_gds_test
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=00:30:00
+#PBS -q debug
+#PBS -A gpu_hack
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/vfd_gds_test.log
+
+set -uo pipefail
+
+VFD_BUILD=/lus/grand/projects/gpu_hack/hyoklee/vfd-gds/build
+CMAKE_BIN=/home/hyoklee/miniconda3/bin
+
+export PATH=${CMAKE_BIN}:$PATH
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime library paths — RAPIDS 24.10 cuFile (1.10.1) before CUDA 11.8 (1.4)
+# ─────────────────────────────────────────────────────────────────────────────
+export LD_LIBRARY_PATH=\
+${VFD_BUILD}/bin:\
+/home/hyoklee/hdf5-install/lib:\
+/soft/applications/dask_rapids/rapids-24.10_polaris/lib:\
+/opt/cray/pe/mpich/9.0.1/ofi/nvidia/23.3/lib:\
+/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/cuda/12.9/targets/x86_64-linux/lib:\
+/opt/cray/pe/lib64:\
+/opt/cray/libfabric/2.2.0rc1/lib64:\
+/opt/cray/pals/1.7/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
+export HDF5_PLUGIN_PATH=${VFD_BUILD}/bin
+
+# cuFile config: enable compat mode so it works on any POSIX filesystem
+export CUFILE_ENV_PATH_JSON=/home/hyoklee/cufile.json
+
+echo "==== HDF5 VFD-GDS Test ===="
+echo "Date:  $(date)"
+echo "Job:   ${PBS_JOBID:-interactive}"
+echo "Node:  $(cat $PBS_NODEFILE | sort -u | tr '\n' ' ')"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] Environment check
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [1] Environment ==="
+nvidia-smi --query-gpu=index,name,driver_version --format=csv,noheader 2>&1 | sed 's/^/  GPU /'
+echo "  libcufile: $(ldconfig -p 2>/dev/null | grep cufile | head -1 || ls ${LD_LIBRARY_PATH%%:*}/libcufile* 2>/dev/null | head -1)"
+echo "  CUFILE_ENV_PATH_JSON: $CUFILE_ENV_PATH_JSON"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] Single-rank test (rank pinned to GPU 0)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [2] mpiexec -n 1 gds_test (single rank, GPU 0) ==="
+cd $VFD_BUILD/bin
+CUDA_VISIBLE_DEVICES=0 mpiexec -n 1 ./gds_test 2>&1
+SINGLE_RC=$?
+echo "  exit: $SINGLE_RC"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [3] Multi-rank test (2 ranks, each pinned to its own GPU)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [3] mpiexec -n 2 gds_test (2 ranks, GPU-pinned) ==="
+cd $VFD_BUILD/bin
+mpiexec -n 2 \
+  --cpu-bind depth -d 16 \
+  bash -c 'export CUDA_VISIBLE_DEVICES=$PMI_LOCAL_RANK; exec ./gds_test' 2>&1
+MPI_RC=$?
+echo "  exit: $MPI_RC"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [4] ctest (for CTest/CDash reporting)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [4] ctest --output-on-failure ==="
+cd $VFD_BUILD
+CUDA_VISIBLE_DEVICES=0 ctest --output-on-failure 2>&1
+CTEST_RC=$?
+echo "  ctest exit: $CTEST_RC"
+echo ""
+
+echo "==== Done ===="
+echo "Date: $(date)"
+
+[ $SINGLE_RC -eq 0 ] && [ $MPI_RC -eq 0 ]

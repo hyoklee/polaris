@@ -6,7 +6,7 @@
 #PBS -A gpu_hack
 #PBS -l filesystems=home:grand
 #PBS -j oe
-#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_gpu_bench_test.log
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_gpu_bench6_test.log
 
 # MiV-Simulator GPU vs CPU benchmark
 # Compares run-network wall time across three modes:
@@ -48,47 +48,26 @@ echo ""
 
 elapsed() { echo $(( $2 - $1 )); }
 
-# Common run-network arguments
-RUN_ARGS=(
-    --config-file=Network_Clamp_Microcircuit_Small_Bilash_PR.yaml
-    --config-prefix=$CASE_DIR/config
-    --template-paths=$CASE_DIR/templates
-    --hoc-lib-path=$CASE_DIR/templates
-    --dataset-prefix=$DATASET_DIR
-    --mechanisms-path=$CASE_DIR/mechanisms
-    --spike-input-path=$DATASET_DIR/Microcircuit_Small/Microcircuit_Small_input_spikes.h5
-    --spike-input-namespace="Input Spikes A Diag"
-    --spike-input-attr="Spike Train"
-    --tstop=500
-    --v-init=-77.0
-    --io-size=1
-    --max-walltime-hours=0.25
-)
+# Use direct Python API (output_results=False) — avoids neuroh5 append_rank_attr_map crash
+# that fires when run-network CLI initializes output file structures at startup.
+NRANKS=1
+BENCH_PY=/home/hyoklee/bin/miv_gpu_bench.py
+MPI_COMMON="--env LD_LIBRARY_PATH=$LD_LIBRARY_PATH --env MIV_SKIP_MPI_CHECK=1 --env OPENBLAS_NUM_THREADS=1 --env NEUROH5_CHUNK_SIZE=65536 --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH --env PYTHONPATH=$CASE_DIR:${PYTHONPATH:-}"
 
+mkdir -p $CASE_DIR/results/gpu_bench_cpu $CASE_DIR/results/gpu_bench_corenrn_cpu $CASE_DIR/results/gpu_bench_corenrn_gpu
 cd $CASE_DIR
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [A] Standard NEURON — CPU
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== [A] Standard NEURON (CPU) ==="
-mkdir -p $CASE_DIR/results/gpu_bench_cpu
 T_CPU_START=$(date +%s)
-mpiexec -n 8 --ppn 8 \
-    --env LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
-    --env MIV_SKIP_MPI_CHECK=1 \
-    --env OPENBLAS_NUM_THREADS=1 \
-    --env NEUROH5_CHUNK_SIZE=65536 \
-    --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH \
-    --env PYTHONPATH=$CASE_DIR:${PYTHONPATH:-} \
-    run-network \
-    "${RUN_ARGS[@]}" \
-    --results-path=$CASE_DIR/results/gpu_bench_cpu \
-    --results-id=cpu \
+mpiexec -n $NRANKS --ppn $NRANKS $MPI_COMMON \
+    python3 $BENCH_PY \
     2>&1 | tee $CASE_DIR/results/gpu_bench_cpu.log
 CPU_EXIT=$?
 T_CPU_END=$(date +%s)
 CPU_ELAPSED=$(elapsed $T_CPU_START $T_CPU_END)
-echo ""
 echo "  CPU elapsed: ${CPU_ELAPSED} s  (exit: $CPU_EXIT)"
 echo ""
 
@@ -96,25 +75,13 @@ echo ""
 # [B] CoreNEURON — CPU
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== [B] CoreNEURON (CPU) ==="
-mkdir -p $CASE_DIR/results/gpu_bench_corenrn_cpu
 T_CNRN_CPU_START=$(date +%s)
-mpiexec -n 8 --ppn 8 \
-    --env LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
-    --env MIV_SKIP_MPI_CHECK=1 \
-    --env OPENBLAS_NUM_THREADS=1 \
-    --env NEUROH5_CHUNK_SIZE=65536 \
-    --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH \
-    --env PYTHONPATH=$CASE_DIR:${PYTHONPATH:-} \
-    run-network \
-    "${RUN_ARGS[@]}" \
-    --use-coreneuron \
-    --results-path=$CASE_DIR/results/gpu_bench_corenrn_cpu \
-    --results-id=corenrn_cpu \
+mpiexec -n $NRANKS --ppn $NRANKS $MPI_COMMON \
+    python3 $BENCH_PY --use-coreneuron \
     2>&1 | tee $CASE_DIR/results/gpu_bench_corenrn_cpu.log
 CNRN_CPU_EXIT=$?
 T_CNRN_CPU_END=$(date +%s)
 CNRN_CPU_ELAPSED=$(elapsed $T_CNRN_CPU_START $T_CNRN_CPU_END)
-echo ""
 echo "  CoreNEURON CPU elapsed: ${CNRN_CPU_ELAPSED} s  (exit: $CNRN_CPU_EXIT)"
 echo ""
 
@@ -122,42 +89,28 @@ echo ""
 # [C] CoreNEURON — GPU (NVIDIA A100)
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== [C] CoreNEURON (GPU — NVIDIA A100) ==="
-mkdir -p $CASE_DIR/results/gpu_bench_corenrn_gpu
 T_CNRN_GPU_START=$(date +%s)
-mpiexec -n 4 --ppn 4 \
-    --env LD_LIBRARY_PATH=$NVHPC_BIN/../lib:$LD_LIBRARY_PATH \
-    --env MIV_SKIP_MPI_CHECK=1 \
-    --env OPENBLAS_NUM_THREADS=1 \
-    --env NEUROH5_CHUNK_SIZE=65536 \
-    --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH \
-    --env PYTHONPATH=$CASE_DIR:${PYTHONPATH:-} \
+mpiexec -n $NRANKS --ppn $NRANKS $MPI_COMMON \
     --env NEURON_CORENEURON_ENABLE_GPU=1 \
-    run-network \
-    "${RUN_ARGS[@]}" \
-    --use-coreneuron \
-    --coreneuron-gpu \
-    --results-path=$CASE_DIR/results/gpu_bench_corenrn_gpu \
-    --results-id=corenrn_gpu \
+    python3 $BENCH_PY --use-coreneuron --coreneuron-gpu \
     2>&1 | tee $CASE_DIR/results/gpu_bench_corenrn_gpu.log
 CNRN_GPU_EXIT=$?
 T_CNRN_GPU_END=$(date +%s)
 CNRN_GPU_ELAPSED=$(elapsed $T_CNRN_GPU_START $T_CNRN_GPU_END)
-echo ""
 echo "  CoreNEURON GPU elapsed: ${CNRN_GPU_ELAPSED} s  (exit: $CNRN_GPU_EXIT)"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────────────
-echo "=== Summary: GPU vs CPU (tstop=500ms, Microcircuit_Small) ==="
+echo "=== Summary: GPU vs CPU (tstop=500ms, Microcircuit_Small, $NRANKS ranks) ==="
 echo ""
-echo "  [A] NEURON CPU (8 ranks):        ${CPU_ELAPSED} s"
-echo "  [B] CoreNEURON CPU (8 ranks):    ${CNRN_CPU_ELAPSED} s"
-echo "  [C] CoreNEURON GPU (4 ranks):    ${CNRN_GPU_ELAPSED} s"
+echo "  [A] NEURON CPU:        ${CPU_ELAPSED} s  (exit $CPU_EXIT)"
+echo "  [B] CoreNEURON CPU:    ${CNRN_CPU_ELAPSED} s  (exit $CNRN_CPU_EXIT)"
+echo "  [C] CoreNEURON GPU:    ${CNRN_GPU_ELAPSED} s  (exit $CNRN_GPU_EXIT)"
 echo ""
-if [ "$CPU_ELAPSED" -gt 0 ] && [ "$CNRN_GPU_ELAPSED" -gt 0 ]; then
-    SPEEDUP=$(python3 -c "print(f'{$CPU_ELAPSED/$CNRN_GPU_ELAPSED:.2f}')" 2>/dev/null || echo "N/A")
-    echo "  GPU speedup vs CPU: ${SPEEDUP}x"
+if [ "${CPU_ELAPSED:-0}" -gt 0 ] && [ "${CNRN_GPU_ELAPSED:-0}" -gt 0 ]; then
+    python3 -c "print(f'  GPU speedup vs CPU: {$CPU_ELAPSED/$CNRN_GPU_ELAPSED:.2f}x')" 2>/dev/null || true
 fi
 echo ""
 echo "==== Done ===="

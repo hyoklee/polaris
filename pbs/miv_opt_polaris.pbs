@@ -108,7 +108,7 @@ mpiexec -n 2 --ppn 2 \
     --results-path=$CASE_DIR/results/network \
     --template-paths=$CASE_DIR/templates \
     --spike_input_path=$CASE_DIR/datasets/Microcircuit_Small/Microcircuit_Small_input_spikes.h5 \
-    --spike_input_namespace='Input Spikes' \
+    --spike_input_namespace='Input Spikes A Diag' \
     --spike_input_attr='Spike Train' \
     --io_size=1 \
     2>&1 | tee $CASE_DIR/results/optimize_run.log
