@@ -1,0 +1,111 @@
+#!/bin/bash
+#PBS -N miv_gpu_bench_build
+#PBS -l select=1:ncpus=32:ngpus=4
+#PBS -l walltime=01:00:00
+#PBS -q debug
+#PBS -A gpu_hack
+#PBS -l filesystems=home:grand
+#PBS -j oe
+#PBS -o /home/hyoklee/NeuroFAIR/wiki/miv_gpu_bench18_test.log
+
+# Rebuild neuroh5 with append_rank_attr_map fix (continue instead of throw_assert)
+# then run GPU vs CPU benchmark.
+
+set -uo pipefail
+
+VENV=/lus/grand/projects/gpu_hack/iowarp/miv_polaris/venv
+NEUROH5_SRC=/home/hyoklee/neuroh5
+NVIDIA_HDF5=/opt/cray/pe/hdf5-parallel/1.14.3.7/nvidia/23.3
+NVIDIA_MPICH=/opt/cray/pe/mpich/9.0.1/ofi/nvidia/23.3
+NVHPC_LIB=/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/compilers/lib
+CASE_DIR=/lus/grand/projects/gpu_hack/iowarp/miv_opt_case
+
+export LD_LIBRARY_PATH=$NVIDIA_HDF5/lib:$NVIDIA_MPICH/lib:$NVHPC_LIB:${LD_LIBRARY_PATH:-}
+export MPI_LIB_NRN_PATH=$NVIDIA_MPICH/lib/libmpi_nvidia.so
+export MIV_SKIP_MPI_CHECK=1
+export OPENBLAS_NUM_THREADS=1
+export NEUROH5_CHUNK_SIZE=65536
+
+source $VENV/bin/activate
+
+echo "==== neuroh5 rebuild + GPU benchmark ===="
+echo "Date:   $(date)"
+echo "Job:    $PBS_JOBID"
+echo "Node:   $(head -1 $PBS_NODEFILE)"
+echo ""
+
+echo "=== [1] GPU check ==="
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1
+echo ""
+
+# [2] neuroh5 already rebuilt with append_rank_attr_map fix in bench12 (PBS 7161529)
+echo "=== [2] neuroh5 status ==="
+python3 -c "import neuroh5; print(f'  neuroh5 loaded OK: {neuroh5.__file__}')" 2>&1
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [3] Pre-compile mechanisms with CoreNEURON support (force=True clears stale cache)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [3] Pre-compile mechanisms (CoreNEURON) ==="
+export PYTHONPATH=$CASE_DIR:${PYTHONPATH:-}
+python3 -c "
+import os; os.environ['MIV_SKIP_MPI_CHECK']='1'
+from miv_simulator.mechanisms import compile_and_load
+path = '$CASE_DIR/mechanisms'
+result = compile_and_load(directory=path, coreneuron=True, force=True)
+print('  compiled to:', result)
+import glob, os
+spec = glob.glob(os.path.join(result, '*/special*'))
+print('  binaries:', sorted(spec))
+" 2>&1
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [4] GPU vs CPU benchmark
+# ─────────────────────────────────────────────────────────────────────────────
+elapsed() { echo $(( $2 - $1 )); }
+NRANKS=1
+BENCH_PY=/home/hyoklee/bin/miv_gpu_bench.py
+MPI_COMMON="--env LD_LIBRARY_PATH=$LD_LIBRARY_PATH --env MIV_SKIP_MPI_CHECK=1 --env OPENBLAS_NUM_THREADS=1 --env NEUROH5_CHUNK_SIZE=65536 --env MPI_LIB_NRN_PATH=$MPI_LIB_NRN_PATH --env PYTHONPATH=$CASE_DIR:${PYTHONPATH:-}"
+
+mkdir -p $CASE_DIR/results/gpu_bench_{cpu,corenrn_cpu,corenrn_gpu}
+# Remove stale results files to avoid HDF5 "group already exists" errors
+rm -f $CASE_DIR/results/Microcircuit_Small*.h5
+cd $CASE_DIR
+
+echo "=== [4A] Standard NEURON (CPU, $NRANKS rank) ==="
+rm -f $CASE_DIR/results/Microcircuit_Small*.h5
+T_A=$(date +%s)
+mpiexec -n $NRANKS --ppn $NRANKS $MPI_COMMON \
+    python3 $BENCH_PY 2>&1 | tee $CASE_DIR/results/gpu_bench_cpu.log
+A_EXIT=$?; T_A_END=$(date +%s); A_ELAPSED=$(elapsed $T_A $T_A_END)
+echo "  CPU elapsed: ${A_ELAPSED} s  (exit: $A_EXIT)"; echo ""
+
+echo "=== [B] CoreNEURON CPU ($NRANKS rank) ==="
+rm -f $CASE_DIR/results/Microcircuit_Small*.h5
+T_B=$(date +%s)
+mpiexec -n $NRANKS --ppn $NRANKS $MPI_COMMON \
+    python3 $BENCH_PY --use-coreneuron 2>&1 | tee $CASE_DIR/results/gpu_bench_corenrn_cpu.log
+B_EXIT=$?; T_B_END=$(date +%s); B_ELAPSED=$(elapsed $T_B $T_B_END)
+echo "  CoreNEURON CPU elapsed: ${B_ELAPSED} s  (exit: $B_EXIT)"; echo ""
+
+echo "=== [C] CoreNEURON GPU ($NRANKS rank, NVIDIA A100) ==="
+rm -f $CASE_DIR/results/Microcircuit_Small*.h5
+T_C=$(date +%s)
+mpiexec -n $NRANKS --ppn $NRANKS $MPI_COMMON \
+    --env NEURON_CORENEURON_ENABLE_GPU=1 \
+    python3 $BENCH_PY --use-coreneuron --coreneuron-gpu \
+    2>&1 | tee $CASE_DIR/results/gpu_bench_corenrn_gpu.log
+C_EXIT=$?; T_C_END=$(date +%s); C_ELAPSED=$(elapsed $T_C $T_C_END)
+echo "  CoreNEURON GPU elapsed: ${C_ELAPSED} s  (exit: $C_EXIT)"; echo ""
+
+echo "=== Summary (tstop=500ms, Microcircuit_Small, $NRANKS rank) ==="
+echo "  [A] NEURON CPU:      ${A_ELAPSED} s  (exit $A_EXIT)"
+echo "  [B] CoreNEURON CPU:  ${B_ELAPSED} s  (exit $B_EXIT)"
+echo "  [C] CoreNEURON GPU:  ${C_ELAPSED} s  (exit $C_EXIT)"
+if [ "${A_ELAPSED:-0}" -gt 0 ] && [ "${C_ELAPSED:-0}" -gt 0 ]; then
+    python3 -c "print(f'  GPU speedup vs CPU: {$A_ELAPSED/$C_ELAPSED:.2f}x')" 2>/dev/null || true
+fi
+echo ""
+echo "==== Done ===="
+echo "Date: $(date)"

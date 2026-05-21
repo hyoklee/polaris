@@ -29,9 +29,16 @@ ${VFD_BUILD}/bin:\
 /opt/cray/pals/1.7/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 export HDF5_PLUGIN_PATH=${VFD_BUILD}/bin
-
-# cuFile config: enable compat mode so it works on any POSIX filesystem
 export CUFILE_ENV_PATH_JSON=/home/hyoklee/cufile.json
+# BEST_EFFORT: ignore advisory lock failures (ENOSYS/EAGAIN) so PHDF5 works
+# on Lustre where flock(LOCK_EX|LOCK_NB) fails for concurrent MPI opens.
+export HDF5_USE_FILE_LOCKING=BEST_EFFORT
+
+# HTTP proxy — required for outbound HTTPS from Polaris compute nodes
+export http_proxy=http://proxy.alcf.anl.gov:3128
+export https_proxy=http://proxy.alcf.anl.gov:3128
+export HTTP_PROXY=http://proxy.alcf.anl.gov:3128
+export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128
 
 echo "==== HDF5 VFD-GDS Test ===="
 echo "Date:  $(date)"
@@ -44,12 +51,12 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== [1] Environment ==="
 nvidia-smi --query-gpu=index,name,driver_version --format=csv,noheader 2>&1 | sed 's/^/  GPU /'
-echo "  libcufile: $(ldconfig -p 2>/dev/null | grep cufile | head -1 || ls ${LD_LIBRARY_PATH%%:*}/libcufile* 2>/dev/null | head -1)"
 echo "  CUFILE_ENV_PATH_JSON: $CUFILE_ENV_PATH_JSON"
+echo "  https_proxy: $https_proxy"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [2] Single-rank test (rank pinned to GPU 0)
+# [2] Single-rank sanity test
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== [2] mpiexec -n 1 gds_test (single rank, GPU 0) ==="
 cd $VFD_BUILD/bin
@@ -65,22 +72,24 @@ echo "=== [3] mpiexec -n 2 gds_test (2 ranks, GPU-pinned) ==="
 cd $VFD_BUILD/bin
 mpiexec -n 2 \
   --cpu-bind depth -d 16 \
-  bash -c 'export CUDA_VISIBLE_DEVICES=$PMI_LOCAL_RANK; exec ./gds_test' 2>&1
-MPI_RC=$?
-echo "  exit: $MPI_RC"
+  bash -c 'export CUDA_VISIBLE_DEVICES=$PMI_LOCAL_RANK HDF5_USE_FILE_LOCKING=BEST_EFFORT; exec ./gds_test' 2>&1
+MPI2_RC=$?
+echo "  exit: $MPI2_RC"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [4] ctest (for CTest/CDash reporting)
+# [4] ctest -D Experimental — builds, tests, and submits to CDash
+#     SITE=polaris and BUILDNAME=vfd-gds/r/gpu are set in the cmake cache.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "=== [4] ctest --output-on-failure ==="
+echo "=== [4] ctest -D Experimental (CDash submission) ==="
 cd $VFD_BUILD
-CUDA_VISIBLE_DEVICES=0 ctest --output-on-failure 2>&1
+ctest -D Experimental 2>&1
 CTEST_RC=$?
 echo "  ctest exit: $CTEST_RC"
+echo "  CDash: https://my.cdash.org/index.php?project=HDF5"
 echo ""
 
 echo "==== Done ===="
 echo "Date: $(date)"
 
-[ $SINGLE_RC -eq 0 ] && [ $MPI_RC -eq 0 ]
+[ $SINGLE_RC -eq 0 ] && [ $MPI2_RC -eq 0 ]
