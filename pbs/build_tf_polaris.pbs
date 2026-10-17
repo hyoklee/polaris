@@ -1,0 +1,126 @@
+#!/bin/bash
+#PBS -N build_tf_polaris
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/build_tf_polaris.log
+#
+# Build everything pbs/tf_congruence_polaris.pbs needs, the Polaris port of
+# ~/aurora/bin/build_cae_s3.pbs + build_tf_aurora.pbs:
+#
+#   [1] AWS SDK for C++ (s3 only), once, into $W/deps (CAE_ENABLE_S3 needs it)
+#   [2] clio-core from ~/clio-core.dev.tf (branch polaris-tf-congruence:
+#       origin/dev + PR #1296, S3 resume with backoff), Release, with
+#         CAE + S3      clio_cae imports the granules from S3
+#         CUDA          the CTE hbm tier is cudaMalloc'd device memory only
+#                       when CTP_ENABLE_GPU is compiled in
+#         FUSE adapter  clio_cte_fuse mounts the clio-fs namespace
+#   [3] fail unless every option survived configure, then check binaries
+#
+# libfuse3: Polaris has libfuse3.so.3.10.5 but no headers. $W/deps/fuse3 holds
+# the 3.10.5 headers and a fuse3.pc pointing at the system library.
+
+set -eo pipefail
+export http_proxy=http://proxy.alcf.anl.gov:3128
+export https_proxy=http://proxy.alcf.anl.gov:3128
+export no_proxy=localhost,127.0.0.1,.alcf.anl.gov,.anl.gov
+
+SRC=/home/hyoklee/clio-core.dev.tf
+W=/eagle/radix-io/hyoklee/tf
+BUILD=${BUILD:-${W}/build_tf_polaris}
+AWS_TAG=1.11.599
+AWS_SRC=${W}/deps/src/aws-sdk-cpp-${AWS_TAG}
+AWS_PREFIX=${W}/deps/aws-sdk-cpp-${AWS_TAG}
+FUSE3_PREFIX=${W}/deps/fuse3
+CMAKE=/home/hyoklee/miniconda3/bin/cmake
+GCC_CC=/usr/bin/gcc-14
+GCC_CXX=/usr/bin/g++-14
+# CUDA 12.9's nvcc, not the HPC SDK 25.9 default (13.0): see
+# ~/bin/clio_core_gpu_dev_c.pbs for the compiler/libcudart mismatch otherwise.
+CUDA_CXX=/opt/nvidia/hpc_sdk/Linux_x86_64/25.9/cuda/12.9/bin/nvcc
+CUDA_LIB=/opt/nvidia/hpc_sdk/Linux_x86_64/25.9/cuda/12.9/targets/x86_64-linux/lib
+export LD_LIBRARY_PATH=${CUDA_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export PKG_CONFIG_PATH=${FUSE3_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
+export CUDAHOSTCXX=$GCC_CXX CUDACXX=$CUDA_CXX
+JOBS=$(nproc)
+T0=$SECONDS
+
+mkdir -p "${W}/deps/src" /home/hyoklee/polaris/logs
+echo "[$(date)] host=$(hostname) jobs=$JOBS source: $(git -C "$SRC" log --oneline -1)"
+
+echo "=== [1] AWS SDK for C++ ${AWS_TAG} (s3 only) -> ${AWS_PREFIX} ==="
+if [ -f "${AWS_PREFIX}/lib/cmake/AWSSDK/AWSSDKConfig.cmake" ]; then
+    echo "already installed"
+else
+    [ -d "$AWS_SRC" ] || git clone --depth 1 --branch "$AWS_TAG" --recurse-submodules \
+        --shallow-submodules https://github.com/aws/aws-sdk-cpp.git "$AWS_SRC"
+    # CMAKE_POLICY_VERSION_MINIMUM: cmake 4.x rejects the <3.5 minimums some
+    # bundled CRT submodules still declare.
+    $CMAKE -S "$AWS_SRC" -B "${AWS_SRC}/build" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=$GCC_CC \
+        -DCMAKE_CXX_COMPILER=$GCC_CXX \
+        -DCMAKE_INSTALL_PREFIX="$AWS_PREFIX" \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_INSTALL_RPATH="${AWS_PREFIX}/lib" \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DBUILD_ONLY=s3 \
+        -DBUILD_SHARED_LIBS=ON \
+        -DENABLE_TESTING=OFF \
+        -DAUTORUN_UNIT_TESTS=OFF
+    $CMAKE --build "${AWS_SRC}/build" -j "$JOBS"
+    $CMAKE --install "${AWS_SRC}/build"
+fi
+echo "  [1] done at +$((SECONDS - T0))s"
+
+echo "=== [2] Configure clio-core -> ${BUILD} ==="
+$CMAKE -S "$SRC" -B "$BUILD" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=$GCC_CC \
+    -DCMAKE_CXX_COMPILER=$GCC_CXX \
+    -DCMAKE_CUDA_HOST_COMPILER=$GCC_CXX \
+    -DCMAKE_CUDA_COMPILER=$CUDA_CXX \
+    -DCMAKE_CUDA_ARCHITECTURES=80 \
+    -DCMAKE_CUDA_STANDARD=17 \
+    -DCMAKE_PREFIX_PATH="${AWS_PREFIX}" \
+    -DCMAKE_BUILD_RPATH="${AWS_PREFIX}/lib;${CUDA_LIB}" \
+    -DPoco_DIR=/home/hyoklee/miniconda3/lib/cmake/Poco \
+    -Dcereal_DIR=/home/hyoklee/miniconda3/lib/cmake/cereal \
+    -Dmsgpack-c_DIR=/home/hyoklee/miniconda3/lib/cmake/msgpack-c \
+    -Dnlohmann_json_ROOT=/home/hyoklee/deps/nlohmann_json \
+    -DCLIO_CORE_ENABLE_RUNTIME=ON \
+    -DCLIO_CORE_ENABLE_CTE=ON \
+    -DCLIO_CORE_ENABLE_CAE=ON \
+    -DCAE_ENABLE_S3=ON \
+    -DCLIO_CORE_ENABLE_CUDA=ON \
+    -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
+    -DCLIO_CORE_ENABLE_TESTS=OFF \
+    -DCLIO_CORE_ENABLE_BENCHMARKS=OFF
+
+echo "=== [3] Verify the options survived configure ==="
+for opt in CAE_ENABLE_S3 CLIO_CORE_ENABLE_CUDA CLIO_CTP_ENABLE_CUDA CLIO_CTE_ENABLE_FUSE_ADAPTER; do
+    grep -q "^${opt}:BOOL=ON" "${BUILD}/CMakeCache.txt" \
+        || { echo "ERROR: ${opt} is not ON after configure" >&2; grep "^${opt}" "${BUILD}/CMakeCache.txt" >&2; exit 1; }
+    echo "${opt}=ON"
+done
+
+echo "=== [4] Build ==="
+$CMAKE --build "$BUILD" -j "$JOBS"
+echo "  [4] done at +$((SECONDS - T0))s"
+
+echo "=== [5] Check binaries ==="
+for exe in clio_run clio_cae clio_cte_fuse cte_tiers cae_s3_tool; do
+    test -x "${BUILD}/bin/${exe}" || { echo "ERROR: ${exe} not built" >&2; exit 1; }
+    echo "OK ${exe}"
+done
+ls "${BUILD}"/bin/libclio_cte_filesystem_runtime.so "${BUILD}"/bin/libclio_cae_core_runtime.so
+
+echo "=== [6] Smoke test: anonymous 1 MiB ranged GET from the TerraFusion bucket ==="
+AWS_NO_SIGN_REQUEST=1 AWS_DEFAULT_REGION=us-west-2 "${BUILD}/bin/cae_s3_tool" get \
+    terrafusiondatasampler P108/TERRA_BF_L1B_O33737_20060422005935_F000_V001.h5 \
+    /tmp/tf_smoke_$$.bin 0 1048576 && ls -l /tmp/tf_smoke_$$.bin && rm -f /tmp/tf_smoke_$$.bin \
+    || echo "WARNING: cae_s3_tool smoke GET failed (see usage above); the import test will tell"
+echo "[$(date)] Done in $((SECONDS - T0))s: ${BUILD}/bin"

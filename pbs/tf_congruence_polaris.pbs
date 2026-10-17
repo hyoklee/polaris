@@ -1,0 +1,363 @@
+#!/bin/bash
+#PBS -N tf_congruence
+#PBS -l select=1:system=polaris
+#PBS -l walltime=02:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q capacity
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/tf_congruence.log
+#
+# Terra Fusion 5-sensor congruence test on ONE Polaris node: the Polaris port of
+# ~/aurora/pbs/tf_congruence.pbs for the two P108 granules holding the most and
+# least congruent blocks (omni/terra_fusion_p108_pair.omni.yaml). Plan:
+# doc/20261016_claude_terra_fusion_congruence_polaris_plan.md.
+#
+#   1. CLIO runtime with CTE tiers set by MODE, clio-fs chimods, FUSE mount.
+#   2. clio_cae imports each granule from s3://terrafusiondatasampler into a
+#      clio-fs file (cfs::), striped over CAE_S3_STREAMS ranged GETs.
+#   3. Each file is checked against S3 (size + first/last/3 random 1 MiB).
+#   4. Pass 1: as soon as a granule lands its pipeline starts (src/tf/tf_granule.sh)
+#      while the next one downloads, as on Aurora.
+#   5. Clean passes after ingest, one granule at a time: GPU regrid
+#      NGPU_PASSES-1 more times, then pytaf (CPU) regrid once.
+#   6. Summary: ingest MB/s, stage and regrid times per pass, C5 of the two
+#      target blocks against Aurora, tier placement, GPU/host memory.
+#
+# MODE (qsub -v MODE=...):
+#   dram    DRAM tier holds everything (score 1.0); Lustre overflow (0.2)
+#   hbm     GPU HBM first: HBM_GB on GPU 0 (1.0) -> DRAM (0.6) -> Lustre (0.2)
+#   lustre  Lustre tier file on /eagle first (1.0); small DRAM last resort (0.1)
+# GPU 0 belongs to the runtime (the HBM tier is one cudaMalloc on the runtime's
+# current device) in every mode, so the analyses always use GPUs 1-3 and the
+# modes stay comparable.
+#
+# Other overrides: GRANULES="O33737" (smoke; use -q debug -l walltime=1:00:00),
+# HBM_GB, RAM_GB, DISK_GB, NGPU_PASSES (3), CPU_PASS (1), CAE_S3_STREAMS (16),
+# CAE_S3_PART_MB (32), INGEST_TRIES (3), KEEP=1 (keep the Lustre tier file).
+
+set -eo pipefail
+W=/eagle/radix-io/hyoklee/tf
+BIN=${BIN:-${W}/build_tf_polaris/bin}
+OMNI=${OMNI:-/home/hyoklee/polaris/omni/terra_fusion_p108_pair.omni.yaml}
+TF=${TF:-/home/hyoklee/polaris/src/tf}
+VENV=${VENV:-${W}/venv-tf}
+PYTAF_DIR=${PYTAF_DIR:-${W}/pytaf}
+GRANULES=${GRANULES:-}
+MODE=${MODE:-dram}
+RAM_GB=${RAM_GB:-120}     # 512 GB node; the two granules are 83.5 GB
+HBM_GB=${HBM_GB:-36}      # A100 40 GB; leave room for the CUDA context
+DISK_GB=${DISK_GB:-200}   # /eagle/radix-io: 4 TB project quota
+NGPU_PASSES=${NGPU_PASSES:-3}
+CPU_PASS=${CPU_PASS:-1}
+export CAE_S3_STREAMS=${CAE_S3_STREAMS:-16}   # Aurora: 16 x 32 MiB best (111 MB/s)
+export CAE_S3_PART_MB=${CAE_S3_PART_MB:-32}
+JOBID=${PBS_JOBID%%.*}
+CLIO_ROOT=${CLIO_ROOT:-${W}/tf_congruence}
+RUN=${RUN:-${CLIO_ROOT}/run_${JOBID:-manual}_${MODE}}
+MNT=/tmp/tf_mnt_${JOBID:-manual}
+PROXY=http://proxy.alcf.anl.gov:3128
+BUCKET_URL=https://terrafusiondatasampler.s3.us-west-2.amazonaws.com
+CUDA_LIB=/opt/nvidia/hpc_sdk/Linux_x86_64/25.9/cuda/12.9/targets/x86_64-linux/lib
+TARGETS="O33737:13:0.966 O18825:0:0.238"   # orbit:block:Aurora C5
+
+case "$MODE" in dram|hbm|lustre) ;; *) echo "MODE must be dram, hbm or lustre (got $MODE)"; exit 2;; esac
+mkdir -p "$RUN/omni" "$RUN/work" "$CLIO_ROOT/data"
+exec > >(tee -a "$RUN/job.log") 2>&1
+T0=$SECONDS
+ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
+ts "host=$(hostname) mode=$MODE run=$RUN"
+ts "clio-core: $(git -C /home/hyoklee/clio-core.dev.tf log --oneline -1)"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader | sed 's/^/    /'
+
+# --- environment ------------------------------------------------------------
+export LD_LIBRARY_PATH=${CUDA_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export CLIO_SERVER_CONF=${RUN}/clio_server.yaml
+export CLIO_MEMFD_DIR=/tmp/clio_memfd_${JOBID:-manual}
+export CLIO_IPC_MODE=SHM
+export AWS_NO_SIGN_REQUEST=1 AWS_DEFAULT_REGION=us-west-2
+export http_proxy=$PROXY https_proxy=$PROXY no_proxy=localhost,127.0.0.1
+export CTP_LOG_LEVEL=${CTP_LOG_LEVEL:-warning}
+mkdir -p "$CLIO_MEMFD_DIR"
+# The Python pipeline runs in a clean environment with the conda module
+# (PyTorch CUDA) and the venv, so it never loads the runtime's libraries.
+cat > "${RUN}/pyenv.sh" <<'EOF'
+#!/bin/bash -l
+module use /soft/modulefiles > /dev/null 2>&1
+module load conda > /dev/null 2>&1
+exec "$@"
+EOF
+chmod +x "${RUN}/pyenv.sh"
+pyrun() {   # pyrun VAR=val ... -- cmd args
+    local vars=()
+    while [ "$1" != "--" ]; do vars+=("$1"); shift; done; shift
+    env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin TERM=dumb "${vars[@]}" \
+        bash -l "${RUN}/pyenv.sh" "$@"
+}
+
+# --- runtime config: CTE tiers by MODE + clio-fs ----------------------------
+LUSTRE_TIER="${CLIO_ROOT}/data/cte_lustre_tier_${JOBID:-manual}.dat"
+tier() {   # tier <path> <bdev_type> <GB> <score> [temporary]
+    echo "
+      - path: \"$1\"
+        bdev_type: \"$2\"
+        capacity_limit: \"$3GB\"
+        score: $4${5:+
+        persistence_level: \"temporary\"}"
+}
+case "$MODE" in
+    dram)   storage="$(tier ram::tf_ram ram "$RAM_GB" 1.0)$(tier "$LUSTRE_TIER" file "$DISK_GB" 0.2 t)" ;;
+    hbm)    storage="$(tier hbm::tf_hbm hbm "$HBM_GB" 1.0)$(tier ram::tf_ram ram "$RAM_GB" 0.6)$(tier "$LUSTRE_TIER" file "$DISK_GB" 0.2 t)" ;;
+    lustre) storage="$(tier "$LUSTRE_TIER" file "$DISK_GB" 1.0 t)$(tier ram::tf_ram ram 8 0.1)" ;;
+esac
+cat > "$CLIO_SERVER_CONF" <<EOF
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 4GB
+networking:
+  port: ${CLIO_PORT:-9413}
+runtime:
+  num_threads: 16
+  queue_depth: 1024
+compose:
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "512.0"
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:${storage}
+    dpe:
+      dpe_type: "max_bw"
+    performance:
+      # No periodic flush: by default CTE copies volatile-tier data to the first
+      # persistent tier (Lustre) every 10 s; on Aurora that moved half a
+      # granule onto Lustre mid-ingest.
+      flush_data_period_ms: 0
+  - mod_name: clio_cte_cache
+    pool_name: clio_cte_cache
+    pool_query: local
+    pool_id: "563.0"
+    next_pool_id: "512.0"
+    min_score: 0.5
+  - mod_name: clio_cte_stream
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "563.0"
+    staging_pool_id: "512.0"
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "563.0"
+EOF
+ts "tiers ($MODE):$(echo "$storage" | awk '/path:/{p=$2} /capacity_limit/{c=$2} /score/{printf " %s=%s@%s", p, c, $2}')  S3 ${CAE_S3_STREAMS} x ${CAE_S3_PART_MB}MiB"
+
+RUNTIME_PID="" FUSE_PID="" SAMPLER_PID="" GPU_SAMPLER_PID=""
+wait_or_kill() {   # wait_or_kill <pid> <seconds> <what>
+    local i
+    for ((i = 0; i < $2; i++)); do kill -0 "$1" 2>/dev/null || return 0; sleep 1; done
+    ts "cleanup: $3 still running after $2 s; killing it"
+    kill -9 "$1" 2>/dev/null
+}
+cleanup() {
+    set +e
+    [ -n "$SAMPLER_PID" ] && kill "$SAMPLER_PID" 2>/dev/null
+    [ -n "$GPU_SAMPLER_PID" ] && kill "$GPU_SAMPLER_PID" 2>/dev/null
+    if [ -n "$FUSE_PID" ]; then
+        ts "cleanup: unmounting clio-fs"
+        timeout 60 fusermount3 -u "$MNT" 2>/dev/null || fusermount3 -u -z "$MNT" 2>/dev/null
+        wait_or_kill "$FUSE_PID" 60 clio_cte_fuse
+    fi
+    if [ -n "$RUNTIME_PID" ]; then
+        ts "cleanup: stopping the runtime"
+        timeout 120 "${BIN}/clio_run" stop >> "${RUN}/runtime.log" 2>&1
+        wait_or_kill "$RUNTIME_PID" 60 clio_run
+    fi
+    ts "cleanup: removing tier files"
+    rm -rf "${CLIO_MEMFD_DIR:?}"
+    [ "${KEEP:-0}" = 1 ] || rm -f "${LUSTRE_TIER:?}"*
+}
+trap cleanup EXIT
+
+# The runtime sees GPU 0 only: the HBM tier's cudaMalloc lands there.
+CUDA_VISIBLE_DEVICES=0 "${BIN}/clio_run" start --fresh --disk "${CLIO_ROOT}/data" --no-viz > "${RUN}/runtime.log" 2>&1 &
+RUNTIME_PID=$!
+for _ in $(seq 1 90); do
+    "${BIN}/clio_run" status > /dev/null 2>&1 && break
+    kill -0 "$RUNTIME_PID" 2>/dev/null || { ts "ERROR: runtime exited; see runtime.log"; tail -20 "${RUN}/runtime.log"; exit 1; }
+    sleep 2
+done
+"${BIN}/clio_run" status > /dev/null 2>&1 || { ts "ERROR: runtime not up after 180 s"; exit 1; }
+ts "runtime up"
+# 'clio_run status' reports ready before compose has created every pool; the
+# HBM bdev (CUDA init + one cudaMalloc of HBM_GB) takes seconds more. Wait
+# until cte_tiers lists every configured tier.
+want_tiers=$(echo "$storage" | grep -c 'path:')
+for _ in $(seq 1 120); do
+    [ "$("${BIN}/cte_tiers" 2>/dev/null | awk 'NR>1' | wc -l)" -ge "$want_tiers" ] && break
+    sleep 1
+done
+"${BIN}/cte_tiers" 2>/dev/null | sed 's/^/    /' || true
+[ "$("${BIN}/cte_tiers" 2>/dev/null | awk 'NR>1' | wc -l)" -ge "$want_tiers" ] \
+    || { ts "ERROR: cte_tiers does not list all $want_tiers tiers after 120 s"; exit 1; }
+if [ "$MODE" = hbm ]; then
+    # Proof that the tier is device memory, not host memory under another name:
+    # GPU 0 must hold about HBM_GB (the info-level log line is hidden at
+    # CTP_LOG_LEVEL=warning).
+    used=$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
+    ts "GPU 0 memory used with the HBM tier: ${used} MiB (tier ${HBM_GB} GB)"
+    [ "$used" -ge $((HBM_GB * 1000 * 9 / 10)) ] \
+        || { ts "ERROR: MODE=hbm but GPU 0 holds only ${used} MiB; the HBM tier is not device memory"; exit 1; }
+fi
+
+mkdir -p "$MNT"
+# No -o max_threads: Polaris has libfuse 3.10.5, which rejects it (added in 3.12).
+CLIO_WITH_RUNTIME=0 "${BIN}/clio_cte_fuse" "$MNT" -f > "${RUN}/fuse.log" 2>&1 &
+FUSE_PID=$!
+for _ in $(seq 1 60); do
+    grep -q " $MNT " /proc/self/mountinfo && timeout 20 stat -f "$MNT" > /dev/null 2>&1 && break
+    sleep 1
+done
+grep -q " $MNT " /proc/self/mountinfo || { ts "ERROR: FUSE mount failed"; tail -20 "${RUN}/fuse.log"; exit 1; }
+ts "clio-fs mounted at $MNT"
+
+# Host memory + tier free space once a minute; GPU memory/utilisation every 5 s.
+(
+    while :; do
+        echo "$(date +%T) $(awk '/^(MemTotal|MemAvailable|Cached|Shmem):/{printf "%s=%dGB ", $1, $2/1048576}' /proc/meminfo)" \
+             "$("${BIN}/cte_tiers" 2>/dev/null | awk 'NR>1{n=split($1,a,"/"); printf "%s=%dMB ", a[n], $NF}')"
+        sleep 60
+    done
+) > "${RUN}/mem.log" 2>&1 &
+SAMPLER_PID=$!
+nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,utilization.memory \
+    --format=csv,noheader,nounits -l 5 > "${RUN}/gpu.log" 2>&1 &
+GPU_SAMPLER_PID=$!
+
+# --- split the OMNI file: one transfer each ---------------------------------
+awk -v dir="${RUN}/omni" -v sel=" ${GRANULES} " '
+    /^transfers:/ { body = 1; next }
+    !body { next }
+    /^  - src:/ {
+        match($0, /TERRA_BF_L1B_O[0-9]+/); orbit = substr($0, RSTART + 13, RLENGTH - 13)
+        keep = (sel == "  ") || index(sel, " " orbit " ")
+        if (keep) { n++; out = sprintf("%s/%02d_%s.omni.yaml", dir, n, orbit); print "transfers:" > out }
+    }
+    keep && /^    |^  - / { print >> out }
+' "$OMNI"
+mapfile -t PARTS < <(ls "${RUN}"/omni/*.omni.yaml)
+[ "${#PARTS[@]}" -gt 0 ] || { ts "ERROR: no transfers selected from $OMNI"; exit 1; }
+ts "${#PARTS[@]} transfer(s) from $(basename "$OMNI")"
+
+verify_file() {   # verify_file <key> <file in mount>
+    local key=$1 f=$2 url="${BUCKET_URL}/$1"
+    local want got off n
+    want=$(curl -sfI -x "$PROXY" "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')
+    got=$(stat -c %s "$f" 2>/dev/null || echo -1)
+    [ "$want" = "$got" ] || { echo "size mismatch: s3=$want file=$got"; return 1; }
+    n=$((got / 1048576))
+    for off in 0 $((n - 1)) $((RANDOM * 32768 % n)) $((RANDOM * 32768 % n)) $((RANDOM * 32768 % n)); do
+        cmp -s <(curl -sf -x "$PROXY" -r $((off * 1048576))-$((off * 1048576 + 1048575)) "$url") \
+               <(dd if="$f" bs=1M skip="$off" count=1 status=none) \
+            || { echo "content mismatch in MiB $off"; return 1; }
+    done
+    echo "size $got OK, 5 x 1 MiB match S3"
+}
+
+analyse() {   # analyse <orbit> <granule path> <pass dir> <regrid> <gpu>
+    pyrun PY="${VENV}/bin/python" TF="$TF" PYTAF_DIR="$PYTAF_DIR" TF_REGRID="$4" \
+          TF_TORCH_DEVICE=cuda CUDA_VISIBLE_DEVICES="$5" -- \
+          bash "${TF}/tf_granule.sh" "$2" "${RUN}/work/$3/$1"
+}
+
+# --- ingest, verify, pass 1 overlapped with the next ingest ------------------
+declare -A APID GPATH
+gpu=1
+INGEST_BYTES=0 INGEST_SECS=0
+for part in "${PARTS[@]}"; do
+    src=$(awk -F'"' '/src:/{print $2}' "$part"); key=${src#s3://terrafusiondatasampler/}
+    dst=$(awk -F'"' '/dst:/{print $2}' "$part"); path=${dst#cfs::}
+    orbit=$(basename "$part" .omni.yaml); orbit=${orbit#*_}
+    t0=$SECONDS
+    set +e
+    for try in $(seq 1 "${INGEST_TRIES:-3}"); do
+        "${BIN}/clio_cae" "$part" >> "${RUN}/cae_${orbit}.log" 2>&1
+        rc=$?
+        [ $rc -eq 0 ] && break
+        ts "ingest of $orbit failed (try $try, rc=$rc after $((SECONDS - t0))s); unlinking the partial file"
+        rm -f "${MNT}${path}"
+        sleep 10
+    done
+    set -e
+    dt=$((SECONDS - t0))
+    if [ $rc -ne 0 ]; then
+        ts "INGEST FAILED $orbit (clio_cae rc=$rc after ${dt}s); see cae_${orbit}.log"
+        grep -E "ERROR|FAILED" "${RUN}/runtime.log" | tail -3
+        continue
+    fi
+    sz=$(stat -c %s "${MNT}${path}" 2>/dev/null || echo 0)
+    INGEST_BYTES=$((INGEST_BYTES + sz)); INGEST_SECS=$((INGEST_SECS + dt))
+    ts "ingested $orbit: $((sz / 1000000)) MB in ${dt}s = $((sz / 1000000 / (dt > 0 ? dt : 1))) MB/s"
+    echo "ingest $orbit $sz $dt" >> "${RUN}/ingest.txt"
+    if ! v=$(verify_file "$key" "${MNT}${path}"); then
+        ts "VERIFY FAILED $orbit: $v -- not analysed"; continue
+    fi
+    ts "verified $orbit: $v"
+    "${BIN}/cte_tiers" 2>/dev/null | sed 's/^/    /' || true
+    GPATH[$orbit]="${MNT}${path}"
+    ( set +e; analyse "$orbit" "${MNT}${path}" gpu_p1 gpu "$gpu" ) &
+    APID[$orbit]=$!
+    ts "pass 1 (gpu, overlapped) of $orbit started on GPU $gpu"
+    gpu=$((gpu % 3 + 1))
+done
+ts "ingest done: $((INGEST_BYTES / 1000000)) MB in ${INGEST_SECS}s of clio_cae = $((INGEST_BYTES / 1000000 / (INGEST_SECS > 0 ? INGEST_SECS : 1))) MB/s"
+for orbit in "${!APID[@]}"; do
+    if wait "${APID[$orbit]}"; then ts "pass 1 $orbit OK: $(tail -1 "${RUN}/work/gpu_p1/${orbit}/run.log")"
+    else ts "pass 1 $orbit FAILED: $(grep '!!!' "${RUN}/work/gpu_p1/${orbit}/run.log" | head -1)"; fi
+done
+ts "tiers after ingest:"; "${BIN}/cte_tiers" 2>/dev/null | sed 's/^/    /' || true
+if [ "$MODE" = lustre ]; then
+    # The bdev appends _node<N> to the configured path. Reads of a just-written Lustre file can come from this node's page cache,
+    # which would make the Lustre tier look like DRAM. Ask Lustre to drop it.
+    lfs getstripe -c -S "${LUSTRE_TIER}"_node* 2>/dev/null | sed 's/^/    stripe /' || true
+    lfs ladvise -a dontneed "${LUSTRE_TIER}"_node* 2>&1 | sed 's/^/    ladvise: /' || true
+    ts "page cache after ladvise: $(awk '/^Cached:/{printf "%d GB", $2/1048576}' /proc/meminfo)"
+fi
+
+# --- clean passes: one granule at a time, nothing else running ---------------
+passes=()
+for ((p = 2; p <= NGPU_PASSES; p++)); do passes+=("gpu_p$p:gpu"); done
+[ "$CPU_PASS" = 1 ] && passes+=("cpu_p1:cpu")
+for pr in "${passes[@]}"; do
+    pass=${pr%%:*} regrid=${pr#*:}
+    for orbit in $(printf '%s\n' "${!GPATH[@]}" | sort); do
+        t0=$SECONDS
+        analyse "$orbit" "${GPATH[$orbit]}" "$pass" "$regrid" 1 || true
+        ts "$pass $orbit: $((SECONDS - t0))s $(tr -d '\n ' < "${RUN}/work/${pass}/${orbit}/stage_times.json" 2>/dev/null)"
+    done
+done
+
+# --- summary -----------------------------------------------------------------
+echo "=== ingest (bytes, s)"; cat "${RUN}/ingest.txt" 2>/dev/null
+echo "=== per pass: stage times (s) | congruence timing"
+for d in "${RUN}"/work/*/O*; do
+    echo "$(basename "$(dirname "$d")") $(basename "$d") $(tr -d '\n ' < "$d/stage_times.json" 2>/dev/null) $(tr -d '\n ' < "$d/timing_b31_WN.json" 2>/dev/null | cut -c1-200)"
+done
+echo "=== target blocks vs Aurora"
+for t in $TARGETS; do
+    IFS=: read -r orbit blk want <<< "$t"
+    for d in "${RUN}"/work/*/"$orbit"; do
+        [ -f "$d/congruence_b31_WN.json" ] || continue
+        got=$(python3 -c "import json,sys;r=[b for b in json.load(open(sys.argv[1])) if b['blk']==int(sys.argv[2])];print('%.4f %s ncell=%d' % (r[0]['congruence'], r[0]['weakest'], r[0]['ncell']) if r else 'missing')" "$d/congruence_b31_WN.json" "$blk")
+        echo "$(basename "$(dirname "$d")") $orbit blk $blk: C5 $got (Aurora $want)"
+    done
+done
+echo "=== GPU peak memory used (MiB) and peak utilisation (%) by index"
+awk -F', ' '{i=$2; if ($3>m[i]) m[i]=$3; if ($4>u[i]) u[i]=$4} END {for (i in m) print "  GPU " i ": " m[i] " MiB, " u[i] "%"}' "${RUN}/gpu.log" | sort
+echo "=== runtime errors: $(grep -c ' ERROR ' "${RUN}/runtime.log" || true)"
+ts "done"
