@@ -1,0 +1,18 @@
+# OMNI
+name: terra_fusion_p108_pair
+tags: aws,terrafusion,public-data
+
+# The two P108 granules holding the most and least congruent blocks of the
+# Aurora P108 run (job 8934328; ~/aurora/doc/20261009_claude_terra_fusion_congruence_aurora.md):
+#   O33737 block 13, C5 = 0.966 (most congruent)
+#   O18825 block 0,  C5 = 0.238 (least congruent)
+# s3://terrafusiondatasampler (us-west-2, public). 83.5 GB in all.
+# Run with ../pbs/tf_congruence_polaris.pbs.
+
+transfers:
+  - src: "s3://terrafusiondatasampler/P108/TERRA_BF_L1B_O33737_20060422005935_F000_V001.h5"   # 29,847,863,689 bytes
+    dst: "cfs::/terra_fusion/TERRA_BF_L1B_O33737_20060422005935_F000_V001.h5"
+    format: "binary"
+  - src: "s3://terrafusiondatasampler/P108/TERRA_BF_L1B_O18825_20030703010024_F000_V001.h5"   # 53,643,715,661 bytes
+    dst: "cfs::/terra_fusion/TERRA_BF_L1B_O18825_20030703010024_F000_V001.h5"
+    format: "binary"
