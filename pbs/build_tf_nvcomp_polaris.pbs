@@ -91,7 +91,7 @@ echo "  [3] done at +$((SECONDS - T0))s"
 
 echo "=== [4] Build everything else (chimods the runtime loads; failures logged) ==="
 set +e
-$CMAKE --build "$BUILD" -j "$JOBS" -- -k 0 > "${BUILD}.all.log" 2>&1
+$CMAKE --build "$BUILD" -j "$JOBS" -- -k > "${BUILD}.all.log" 2>&1
 rc=$?
 set -e
 echo "  [4] rc=$rc at +$((SECONDS - T0))s; first errors:"

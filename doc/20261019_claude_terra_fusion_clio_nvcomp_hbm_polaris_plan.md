@@ -116,8 +116,8 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | --- | --- | --- | --- |
 | 7762190 | debug | clang-CUDA build with compressor + nvCOMP | exit 2 after 2 min 20 s: issue 1 |
 | 7762191 | capacity | data prep + smoke + matrix (afterok 7762190) | deleted by PBS with the failed build |
-| 7762243 | debug | build, with the issue 1 fix | queued |
-| 7762244 | capacity | data prep + smoke + matrix (afterok 7762243) | held on the build |
+| 7762243 | debug | build, with the issue 1 fix | **OK**, 71 s (most objects reused); waited ~1 h in the debug queue |
+| 7762244 | capacity | data prep + smoke + matrix (afterok 7762243) | queued behind the 3-hourly `clio_core_gpu_dev_c` job (capacity runs 1 job per project) |
 
 ## Issues
 
@@ -130,3 +130,7 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    when it exists, commit e8c5b033 on `polaris-tf-congruence` (local, not
    pushed). The clang-CUDA toolchain itself configured cleanly: clang 22.1.4,
    CUDA 12.9.1, nvCOMP 6.0.0.12 found.
+2. **Build script: `-- -k 0` is GNU make's "target 0".** Step [4] (build the
+   rest of the tree, keep going) did nothing (`No rule to make target '0'`).
+   The bench's own dependencies, the chimods it loads among them, were all
+   built in step [3], so the run is not affected. Now `-- -k`.
