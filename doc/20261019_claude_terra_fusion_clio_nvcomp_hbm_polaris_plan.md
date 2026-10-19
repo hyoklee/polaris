@@ -117,7 +117,7 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7762190 | debug | clang-CUDA build with compressor + nvCOMP | exit 2 after 2 min 20 s: issue 1 |
 | 7762191 | capacity | data prep + smoke + matrix (afterok 7762190) | deleted by PBS with the failed build |
 | 7762243 | debug | build, with the issue 1 fix | **OK**, 71 s (most objects reused); waited ~1 h in the debug queue |
-| 7762244 | capacity | data prep + smoke + matrix (afterok 7762243) | queued behind the 3-hourly `clio_core_gpu_dev_c` job (capacity runs 1 job per project) |
+| 7762244 | capacity | data prep + smoke + matrix (afterok 7762243) | ran 22:45–23:25 UTC, 40 min: **every raw run OK, every nvCOMP run crashed** (issue 3) |
 
 ## Issues
 
@@ -134,3 +134,43 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    rest of the tree, keep going) did nothing (`No rule to make target '0'`).
    The bench's own dependencies, the chimods it loads among them, were all
    built in step [3], so the run is not affected. Now `-- -k`.
+3. **Every nvCOMP run aborts in the write pass; raw runs are fine.** All 61
+   nvCOMP cells, including the synthetic `smoke_lz4`, died with rc 134, 139 or 1
+   after 2–35 s. Every log starts the same way: `[gpu_vector] FATAL table=N: a
+   fetch of 0 page(s) from page P at generation 0 was REFUSED by the runtime`,
+   where P is the first page of block N's slice (N × pages per block). Then
+   `CUDA Error 719: unspecified launch failure` from the `__trap()`, and a
+   segfault or abort during teardown. The write pass fetches each page before
+   writing it (write-allocate). Upstream calls the get_error on that first
+   touch "benign", but since 2fb27726 (2026-09-23, "a failed fetch now stops
+   the kernel") any failed fetch traps. With the compressor in the chain, that
+   first-touch get of a page that does not exist yet comes back non-zero.
+   `RESULTS.md`'s compressed numbers predate that commit. So this is likely a
+   clio-core regression in the compressed gpu_vector path, not a Polaris
+   problem. To be confirmed by a traced rerun (`CLIO_CODEC_TRACE=1
+   CLIO_DR_LOG=1`).
+
+## Results so far (job 7762244, raw only)
+
+GB/s of logical bytes; 16 blocks × 8 slots, 256 KiB pages, batched reads of 8
+pages unless noted. Every row passed the position-weighted checksum.
+
+| Data | Tier | Size MB | Write GB/s | Read GB/s |
+| --- | --- | --- | --- | --- |
+| synthetic | fit (HBM) | 1024 | 0.45 | 0.25 |
+| A_O33737 | fit (HBM) | 1960 | 0.46 | 0.29 |
+| A_O33737 | fit, per-page faults (`--read-batch 0`) | 1960 | 0.29 | **2.54** |
+| A_O33737 | dram (¼ in HBM) | 1960 | 0.28 | 0.29 |
+| A_O33737 | lustre (¼ in HBM) | 1960 | timed out at 600 s | — |
+| A_O33737 | host (pinned DRAM, no HBM) | 1960 | 0.20 | 0.26 |
+| A_O18825 | fit / dram / lustre / host | 2652 | 0.16 / 0.21 / 0.23 / 0.31 | 0.26 / 0.27 / 0.23 / 0.23 |
+| H_O33737 | fit / dram | 2048 | 0.30 / 0.30 | 0.23 / 0.26 |
+| H_O18825 | fit / dram | 2048 | 0.25 / 0.31 | 0.24 / 0.26 |
+
+* All raw rates are ~0.2–0.5 GB/s whatever the tier, an order of magnitude below
+  upstream's `RESULTS.md` (3 GB/s write, 27 GB/s read for raw in the top tier).
+  The tier makes no difference, so the per-fault round trip through the CPU
+  runtime sets the rate, not the medium.
+* Batched reads (`--read-batch 8`) were **9× slower** than per-page faults
+  (0.29 vs 2.54 GB/s), the opposite of upstream. Worth a separate look.
+* GPU 0 peaked at 7.6 GB used and 100% utilisation.
