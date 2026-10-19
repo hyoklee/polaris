@@ -1,0 +1,131 @@
+#!/bin/bash
+#PBS -N tf_gpu_inflate
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:30:00
+#PBS -l filesystems=home:eagle
+#PBS -q capacity
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/tf_gpu_inflate.log
+#
+# Option D of doc/20261016_claude_terra_fusion_congruence_polaris_plan.md:
+# inflate the HDF5 deflate chunks the congruence pipeline reads on the A100
+# with nvCOMP, against HDF5/zlib on the CPU (src/tf/tf_gpu_inflate.py).
+#
+#   1. Fetch the two P108 granules from S3 to Eagle once (16 ranged GETs at a
+#      time through the ALCF proxy); kept in $GDIR for later runs.
+#   2. Run tf_gpu_inflate.py (HDF5's own chunks, inflated on the GPU) and
+#      tf_gpu_reencode.py (the same data re-encoded in 64 KiB nvCOMP chunks) on
+#      each granule on GPU 0; nothing else uses the node (no CLIO runtime).
+#
+# Overrides: GRANULES ("O33737 O18825"), STREAMS (16), PART_MB (64),
+# INFLATE_THREADS (16), GPU_MAX_CHUNK_MB (8), GDIR.
+
+set -eo pipefail
+W=/eagle/radix-io/hyoklee/tf
+TF=${TF:-/home/hyoklee/polaris/src/tf}
+VENV=${VENV:-${W}/venv-tf}
+GDIR=${GDIR:-${W}/granules}
+GRANULES=${GRANULES:-"O33737 O18825"}
+STREAMS=${STREAMS:-16}
+PART_MB=${PART_MB:-64}
+JOBID=${PBS_JOBID%%.*}
+RUN=${W}/tf_gpu_inflate/run_${JOBID:-manual}
+PROXY=http://proxy.alcf.anl.gov:3128
+BUCKET_URL=https://terrafusiondatasampler.s3.us-west-2.amazonaws.com
+declare -A KEY=(
+  [O33737]="P108/TERRA_BF_L1B_O33737_20060422005935_F000_V001.h5"
+  [O18825]="P108/TERRA_BF_L1B_O18825_20030703010024_F000_V001.h5")
+declare -A SIZE=([O33737]=29847863689 [O18825]=53643715661)
+
+mkdir -p "$RUN" "$GDIR"
+exec > >(tee -a "$RUN/job.log") 2>&1
+T0=$SECONDS
+ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
+ts "host=$(hostname) run=$RUN"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader | sed 's/^/    /'
+
+# --- 1. granules on Eagle ----------------------------------------------------
+fetch() {   # fetch <orbit>: ranged GETs written in place at their offsets
+  local o=$1 f=${GDIR}/$(basename "${KEY[$1]}") n=${SIZE[$1]}
+  if [ -f "$f" ] && [ "$(stat -c %s "$f")" = "$n" ] && [ -f "$f.ok" ]; then
+    ts "have $o"; return 0
+  fi
+  rm -f "$f" "$f.ok"
+  local t=$SECONDS
+  python3 "${RUN}/fetch.py" "$BUCKET_URL/${KEY[$o]}" "$f" "$n" "$((PART_MB * 1048576))" "$STREAMS" ||
+    { ts "ERROR: fetch $o failed"; return 1; }
+  local dt=$((SECONDS - t))
+  # spot-check 5 x 1 MiB against S3 (first, last, 3 random)
+  local offs="0 $((n - 1048576)) $((RANDOM * RANDOM % (n - 1048576))) $((RANDOM * RANDOM % (n - 1048576))) $((RANDOM * RANDOM % (n - 1048576)))"
+  for a in $offs; do
+    cmp <(curl -sf --proxy "$PROXY" -r $a-$((a + 1048575)) "$BUCKET_URL/${KEY[$o]}") \
+        <(dd if="$f" bs=1M iflag=skip_bytes,count_bytes skip=$a count=1048576 status=none) ||
+      { ts "ERROR: $o differs from S3 at $a"; return 1; }
+  done
+  touch "$f.ok"
+  ts "fetched $o: $((n / 1000000)) MB in ${dt}s = $((n / 1000000 / (dt > 0 ? dt : 1))) MB/s, 5 x 1 MiB match S3"
+}
+cat > "${RUN}/fetch.py" <<'EOF2'
+# fetch.py <url> <file> <size> <part bytes> <streams>: parallel ranged GETs,
+# each written at its offset with pwrite and checked for length; 8 tries each.
+import os, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+url, path, n, part, streams = sys.argv[1], sys.argv[2], *map(int, sys.argv[3:6])
+fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644); os.ftruncate(fd, n)
+def get(a):
+    # A connection cut mid-part (seen through the proxy at ~200 MB) resumes
+    # from the last byte written instead of starting the part again.
+    b = min(a + part, n) - 1
+    o = a
+    for k in range(8):
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(url, headers={'Range': f'bytes={o}-{b}'}), timeout=120)
+            while True:
+                buf = r.read(8 << 20)
+                if not buf: break
+                os.pwrite(fd, buf, o); o += len(buf)
+            if o == b + 1: return
+            raise IOError(f'short read, {b + 1 - o} bytes left')
+        except Exception as e:
+            print(f'part {a}: try {k + 1}: {e}', flush=True); time.sleep(2 * (k + 1))
+    raise SystemExit(f'part {a} failed')
+with ThreadPoolExecutor(streams) as ex:
+    list(ex.map(get, range(0, n, part)))
+os.fsync(fd); os.close(fd)
+EOF2
+export http_proxy=$PROXY https_proxy=$PROXY
+for o in $GRANULES; do fetch "$o"; done
+
+# --- 2. inflate benchmark ------------------------------------------------------
+cat > "${RUN}/pyenv.sh" <<'EOF'
+#!/bin/bash -l
+module use /soft/modulefiles > /dev/null 2>&1
+module load conda > /dev/null 2>&1
+exec "$@"
+EOF
+chmod +x "${RUN}/pyenv.sh"
+nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader -l 1 \
+  > "${RUN}/gpu.log" 2>&1 &
+SMI=$!
+rc=0
+pyrun() {
+  env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin TERM=dumb \
+      INFLATE_THREADS=${INFLATE_THREADS:-16} GPU_MAX_CHUNK_MB=${GPU_MAX_CHUNK_MB:-8} \
+      CUDA_VISIBLE_DEVICES=0 bash -l "${RUN}/pyenv.sh" "${VENV}/bin/python" "$@"
+}
+for o in $GRANULES; do
+  f=${GDIR}/$(basename "${KEY[$o]}")
+  ts "inflate benchmark: $o"
+  pyrun "${TF}/tf_gpu_inflate.py" "$f" "${RUN}/inflate_${o}.json" ||
+    { rc=$?; ts "ERROR: inflate benchmark $o rc=$rc"; }
+  ts "re-encode benchmark: $o"
+  pyrun "${TF}/tf_gpu_reencode.py" "$f" "${RUN}/reencode_${o}.json" ||
+    { rc=$?; ts "ERROR: re-encode benchmark $o rc=$rc"; }
+done
+kill $SMI 2>/dev/null || true
+for i in 0; do
+  awk -F', ' -v g=$i '$2==g{u=$3+0; m=$4+0; if(u>U)U=u; if(m>M)M=m} END{printf "  GPU %d peak: %d%%, %d MiB\n", g, U, M}' "${RUN}/gpu.log"
+done
+ts "done rc=$rc"
+exit $rc

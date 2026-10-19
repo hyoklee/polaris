@@ -283,6 +283,8 @@ when the consumer runs on the GPU. That is the case option D (GPU
 decompression) would create; this measurement is the argument for or against
 building it.
 
+Option D was measured on 2026-10-17: `20261017_claude_terra_fusion_gpu_inflate_polaris.md`.
+
 ## Issues found on Polaris
 
 1. **AWS SDK for C++ not installed.** `CAE_ENABLE_S3` needs it; built 1.11.599
