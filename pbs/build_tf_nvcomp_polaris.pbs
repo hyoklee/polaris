@@ -1,0 +1,105 @@
+#!/bin/bash
+#PBS -N build_tf_nvcomp
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/build_tf_nvcomp_polaris.log
+#
+# Build clio-core for pbs/tf_clio_nvcomp_polaris.pbs: CLIO's own GPU tiering
+# path, where CTE stores gpu_vector pages in an HBM tier compressed with nvCOMP
+# and decodes them on the A100 (device -> device). That path needs
+#
+#   CLIO_GPU_CLANG=ON         gpu_vector's device API is C++20 coroutines, which
+#                             nvcc cannot compile; clang 22 is the CUDA compiler
+#   CLIO_CTE_ENABLE_COMPRESS  builds the compressor chimod
+#   nvcomp                    found via nvcomp-config.cmake; the only C++
+#                             nvCOMP on Polaris is the pip wheel's (6.0) in the
+#                             Terra Fusion venv
+#
+# The S3/FUSE build ($W/build_tf_polaris, nvcc) stays as it is. Source:
+# ~/clio-core.dev.tf, branch polaris-tf-congruence (origin/dev + PR #1296 +
+# libaio fix + the stream bench's --data-file/--codec).
+
+set -eo pipefail
+export http_proxy=http://proxy.alcf.anl.gov:3128
+export https_proxy=http://proxy.alcf.anl.gov:3128
+export no_proxy=localhost,127.0.0.1,.alcf.anl.gov,.anl.gov
+
+SRC=/home/hyoklee/clio-core.dev.tf
+W=/eagle/radix-io/hyoklee/tf
+BUILD=${BUILD:-${W}/build_tf_nvcomp}
+CMAKE=/home/hyoklee/miniconda3/bin/cmake
+GCC_CC=/usr/bin/gcc-14
+GCC_CXX=/usr/bin/g++-14
+CLANGXX=/soft/compilers/llvm/release-22.1.4/bin/clang++
+# A standard-layout toolkit for clang (the HPC SDK splits math libs out).
+CUDA_ROOT=/soft/compilers/cudatoolkit/cuda-12.9.1
+NVCOMP_ROOT=${W}/venv-tf/lib/python3.12/site-packages/nvidia/libnvcomp
+export LD_LIBRARY_PATH=${CUDA_ROOT}/lib64:${NVCOMP_ROOT}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+JOBS=$(nproc)
+T0=$SECONDS
+
+mkdir -p /home/hyoklee/polaris/logs
+echo "[$(date)] host=$(hostname) jobs=$JOBS source: $(git -C "$SRC" log --oneline -1)"
+git -C "$SRC" status --short | sed 's/^/    /'
+$CLANGXX --version | head -1
+
+echo "=== [1] Configure -> ${BUILD} ==="
+# CUDA 12.9 is newer than clang 22 knows ("partially supported"); the flag
+# keeps that warning from turning every CUDA TU's log into noise.
+$CMAKE -S "$SRC" -B "$BUILD" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=$GCC_CC \
+    -DCMAKE_CXX_COMPILER=$GCC_CXX \
+    -DCMAKE_CUDA_COMPILER=$CLANGXX \
+    -DCUDAToolkit_ROOT=$CUDA_ROOT \
+    -DCMAKE_CUDA_FLAGS="--cuda-path=${CUDA_ROOT} -Wno-unknown-cuda-version" \
+    -DCMAKE_CUDA_ARCHITECTURES=80 \
+    -DCLIO_GPU_CLANG=ON \
+    -Dnvcomp_DIR=${NVCOMP_ROOT}/lib64/cmake/nvcomp \
+    -DCMAKE_BUILD_RPATH="${CUDA_ROOT}/lib64;${NVCOMP_ROOT}/lib64" \
+    -DPoco_DIR=/home/hyoklee/miniconda3/lib/cmake/Poco \
+    -Dcereal_DIR=/home/hyoklee/miniconda3/lib/cmake/cereal \
+    -Dmsgpack-c_DIR=/home/hyoklee/miniconda3/lib/cmake/msgpack-c \
+    -Dnlohmann_json_ROOT=/home/hyoklee/deps/nlohmann_json \
+    -DCLIO_CORE_ENABLE_RUNTIME=ON \
+    -DCLIO_CORE_ENABLE_CTE=ON \
+    -DCLIO_CORE_ENABLE_CAE=OFF \
+    -DCLIO_CORE_ENABLE_CEE=OFF \
+    -DCLIO_CORE_ENABLE_CUDA=ON \
+    -DCLIO_CTE_ENABLE_COMPRESS=ON \
+    -DCLIO_CORE_ENABLE_TESTS=OFF \
+    -DCLIO_CORE_ENABLE_BENCHMARKS=OFF \
+    -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
+    -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
+    2>&1 | tee "${BUILD}.configure.log"
+grep -E 'nvcomp|gpu_vector|GPU toolchain|zstd|lz4' "${BUILD}.configure.log" | sed 's/^/    /'
+
+echo "=== [2] Verify the options survived configure ==="
+for opt in CLIO_CORE_ENABLE_CUDA CLIO_GPU_CLANG CLIO_CTE_ENABLE_COMPRESS CLIO_CTP_ENABLE_NVCOMP; do
+    grep -q "^${opt}:BOOL=ON" "${BUILD}/CMakeCache.txt" \
+        || { echo "ERROR: ${opt} is not ON after configure" >&2; grep "^${opt}" "${BUILD}/CMakeCache.txt" >&2; exit 1; }
+    echo "${opt}=ON"
+done
+
+echo "=== [3] Build the stream bench (must succeed) ==="
+$CMAKE --build "$BUILD" -j "$JOBS" --target clio_gpu_vector_stream_bench
+echo "  [3] done at +$((SECONDS - T0))s"
+
+echo "=== [4] Build everything else (chimods the runtime loads; failures logged) ==="
+set +e
+$CMAKE --build "$BUILD" -j "$JOBS" -- -k 0 > "${BUILD}.all.log" 2>&1
+rc=$?
+set -e
+echo "  [4] rc=$rc at +$((SECONDS - T0))s; first errors:"
+grep -m 10 -E 'error:|Error [0-9]' "${BUILD}.all.log" | cut -c1-240 | sed 's/^/    /' || true
+
+echo "=== [5] Check ==="
+ls -l "${BUILD}/bin/clio_gpu_vector_stream_bench"
+ls "${BUILD}"/bin/lib*compressor*runtime*.so "${BUILD}"/bin/lib*bdev*runtime*.so 2>/dev/null | sed 's/^/    /'
+ldd "${BUILD}/bin/clio_gpu_vector_stream_bench" | grep -E 'nvcomp|cudart|not found' | sed 's/^/    /'
+"${BUILD}/bin/clio_gpu_vector_stream_bench" --help | head -3
+echo "[$(date)] Done in $((SECONDS - T0))s: ${BUILD}/bin"

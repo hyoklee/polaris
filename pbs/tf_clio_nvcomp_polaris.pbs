@@ -1,0 +1,170 @@
+#!/bin/bash
+#PBS -N tf_clio_nvcomp
+#PBS -l select=1:system=polaris
+#PBS -l walltime=03:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q capacity
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/tf_clio_nvcomp_polaris.log
+#
+# CLIO's own GPU memory tiering with nvCOMP, on Terra Fusion data. Plan:
+# doc/20261019_claude_terra_fusion_clio_nvcomp_hbm_polaris_plan.md.
+#
+# In clio-core, nvCOMP runs only on device-resident data: a gpu_vector page is
+# compressed on the GPU, stored in the CTE tiers (HBM first), and decoded on
+# the GPU straight into the consumer's page. Host writers (FUSE, CAE S3 import,
+# netCDF4/h5py) cannot use a GPU codec: the compressor fails such puts on
+# purpose. So this measures the gpu_vector path with real data, using
+# clio_gpu_vector_stream_bench (write pass, then a cold read pass) on GPU 0:
+#
+#   [0] input files from the cached granules (src/tf/tf_dump_arrays.py):
+#         A_<orbit>.bin  the pipeline's arrays, decoded (2.05 / 2.78 GB)
+#         H_<orbit>.bin  2 GiB of the granule's own (deflated) bytes
+#   [1] smoke: synthetic data, raw and nvcomp-lz4, everything in HBM
+#   [2] matrix, most important first; each run is one process with its own
+#       runtime:
+#         tier   fit    HBM top tier holds all of it
+#                dram   HBM tier holds 1/4 of the raw size, spill to DRAM
+#                lustre HBM tier holds 1/4, spill to a file on /eagle
+#                host   pinned host-memory top tier holds all (no HBM)
+#         codec  raw | nvcomp lz4, zstd, gdeflate, deflate, ans
+#   [3] summary table from the GVS lines
+#
+# Overrides: DATA, TIERS, CODECS, BLOCKS (16), PAGE_KB (256), READ_BATCH (8),
+# RUN_TIMEOUT (600 s), DEADLINE_MIN (stop starting runs when fewer remain).
+
+set -eo pipefail
+W=/eagle/radix-io/hyoklee/tf
+BIN=${BIN:-${W}/build_tf_nvcomp/bin}
+TF=${TF:-/home/hyoklee/polaris/src/tf}
+VENV=${VENV:-${W}/venv-tf}
+GRAN=${W}/granules
+DATA_DIR=${DATA_DIR:-${W}/tf_clio_nvcomp/data}
+JOBID=${PBS_JOBID%%.*}
+RUN=${RUN:-${W}/tf_clio_nvcomp/run_${JOBID:-manual}}
+CUDA_ROOT=/soft/compilers/cudatoolkit/cuda-12.9.1
+NVCOMP_ROOT=${VENV}/lib/python3.12/site-packages/nvidia/libnvcomp
+DATA=${DATA:-"A_O33737 A_O18825 H_O33737 H_O18825"}
+TIERS=${TIERS:-"fit dram lustre host"}
+CODECS=${CODECS:-"raw zstd lz4 gdeflate deflate ans"}
+BLOCKS=${BLOCKS:-16}
+PAGE_KB=${PAGE_KB:-256}
+READ_BATCH=${READ_BATCH:-8}
+RUN_TIMEOUT=${RUN_TIMEOUT:-600}
+DEADLINE_MIN=${DEADLINE_MIN:-15}
+WALL_MIN=${WALL_MIN:-180}
+
+mkdir -p "$RUN" "$DATA_DIR"
+exec > >(tee -a "$RUN/job.log") 2>&1
+T0=$SECONDS
+ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
+ts "host=$(hostname) run=$RUN"
+ts "clio-core: $(git -C /home/hyoklee/clio-core.dev.tf log --oneline -1)"
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader | sed 's/^/    /'
+export LD_LIBRARY_PATH=${BIN}:${CUDA_ROOT}/lib64:${NVCOMP_ROOT}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export CTP_LOG_LEVEL=${CTP_LOG_LEVEL:-warning}
+test -x "${BIN}/clio_gpu_vector_stream_bench" || { ts "ERROR: no stream bench in $BIN"; exit 1; }
+
+nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,utilization.memory \
+    --format=csv,noheader,nounits -l 1 -i 0 > "${RUN}/gpu.log" 2>&1 &
+GPU_SAMPLER_PID=$!
+trap 'kill $GPU_SAMPLER_PID 2>/dev/null; rm -f "${RUN}"/work/*/spill.bin*' EXIT
+
+# --- [0] input files ----------------------------------------------------------
+cat > "${RUN}/pyenv.sh" <<'EOF'
+#!/bin/bash -l
+module use /soft/modulefiles > /dev/null 2>&1
+module load conda > /dev/null 2>&1
+exec "$@"
+EOF
+for orbit in O33737 O18825; do
+    [ -s "${DATA_DIR}/A_${orbit}.bin" ] && [ -s "${DATA_DIR}/H_${orbit}.bin" ] && continue
+    g=$(ls "${GRAN}"/TERRA_BF_L1B_${orbit}_*.h5)
+    ts "[0] writing A_/H_${orbit}.bin from $(basename "$g")"
+    env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin PYTHONPATH="$TF" \
+        bash -l "${RUN}/pyenv.sh" "${VENV}/bin/python" "${TF}/tf_dump_arrays.py" "$g" "$DATA_DIR"
+done
+ls -l "$DATA_DIR" | sed 's/^/    /'
+
+# --- one bench run --------------------------------------------------------------
+echo -e "label\tdata\ttier\tcodec\trc\twall_s\tGVS" > "${RUN}/results.tsv"
+bench() {   # bench <label> <data name|synthetic> <tier> <codec> [extra args]
+    local label=$1 data=$2 tier=$3 codec=$4; shift 4
+    local d="${RUN}/work/${label}" mb args=() t0 rc line
+    mkdir -p "$d"
+    if [ "$data" = synthetic ]; then
+        mb=1024; args+=(--total-mb "$mb" --zero-pct 30)
+    else
+        mb=$(( $(stat -c %s "${DATA_DIR}/${data}.bin") >> 20 ))
+        args+=(--data-file "${DATA_DIR}/${data}.bin" --total-mb "$mb")
+    fi
+    case "$tier" in
+        fit)    args+=(--tier-type hbm --vram-mb $((mb * 5 / 4 + 256)) --spill-type ram --spill-mb $((mb * 2))) ;;
+        dram)   args+=(--tier-type hbm --vram-mb $((mb / 4)) --spill-type ram --spill-mb $((mb * 2))) ;;
+        lustre) args+=(--tier-type hbm --vram-mb $((mb / 4)) --spill-type file --spill-path "${d}/spill.bin" --spill-mb $((mb * 2))) ;;
+        host)   args+=(--tier-type pinned --vram-mb $((mb * 5 / 4 + 256)) --spill-type ram --spill-mb $((mb * 2))) ;;
+    esac
+    [ "$codec" = raw ] || args+=(--codec "$codec")
+    args+=(--blocks "$BLOCKS" --page-kb "$PAGE_KB" --read-batch "$READ_BATCH" "$@")
+    echo "${BIN}/clio_gpu_vector_stream_bench ${args[*]}" > "${d}/cmd"
+    t0=$SECONDS
+    set +e
+    (cd "$d" && CUDA_VISIBLE_DEVICES=0 timeout -k 30 "$RUN_TIMEOUT" \
+        "${BIN}/clio_gpu_vector_stream_bench" "${args[@]}") > "${d}/out.log" 2>&1
+    rc=$?
+    set -e
+    line=$(grep -m1 '^GVS ' "${d}/out.log" || echo "no GVS line: $(grep -m1 -iE 'error|fail|abort' "${d}/out.log" | cut -c1-160)")
+    echo -e "${label}\t${data}\t${tier}\t${codec}\t${rc}\t$((SECONDS - t0))\t${line}" >> "${RUN}/results.tsv"
+    ts "${label}: rc=${rc} $((SECONDS - t0))s $(echo "$line" | grep -oE '(stored|ratio|write_GBps|read_GBps|checksum)=[^ ]+' | tr '\n' ' ')"
+    rm -f "${d}"/spill.bin*   # the file bdev appends _node<N>
+    # A hung run leaves the GPU dirty for the next one; wait for its memory to drain.
+    for _ in $(seq 1 30); do
+        [ "$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')" -lt 1000 ] && break
+        sleep 1
+    done
+}
+time_left() { [ $(( WALL_MIN * 60 - (SECONDS - T0) )) -gt $(( DEADLINE_MIN * 60 )) ]; }
+
+# --- [1] smoke ------------------------------------------------------------------
+ts "[1] smoke"
+bench smoke_raw synthetic fit raw
+bench smoke_lz4 synthetic fit lz4
+if ! grep -q 'checksum=OK' "${RUN}/work/smoke_raw/out.log"; then
+    ts "ERROR: raw smoke failed; see ${RUN}/work/smoke_raw/out.log"; tail -30 "${RUN}/work/smoke_raw/out.log"; exit 1
+fi
+
+# --- [2] matrix -------------------------------------------------------------------
+# Most important first: the decoded arrays (what a GPU consumer reads) with
+# the data in HBM, then spilled; the stored-HDF5 bytes after.
+ts "[2] matrix: data=[$DATA] tiers=[$TIERS] codecs=[$CODECS]"
+for data in $DATA; do
+    for tier in $TIERS; do
+        case "$data:$tier" in H_*:lustre|H_*:host) continue ;; esac
+        for codec in $CODECS; do
+            time_left || { ts "deadline: skipping the rest"; break 3; }
+            bench "${data}_${tier}_${codec}" "$data" "$tier" "$codec"
+        done
+    done
+done
+# Per-page faults (no batching) for the main case, if time remains.
+for codec in raw zstd; do
+    time_left || break
+    bench "A_O33737_fit_${codec}_rb0" A_O33737 fit "$codec" --read-batch 0
+done
+
+# --- [3] summary --------------------------------------------------------------------
+echo "=== results (GB/s are of the logical, uncompressed bytes)"
+printf '%-30s %-6s %-9s %3s %6s %9s %7s %8s %8s %s\n' run tier codec rc wall stored_MB ratio write_GB/s read_GB/s check
+awk -F'\t' 'NR > 1 {
+    g = $7; s = r = w = rd = c = "-"
+    if (match(g, /stored=[^ ]+/)) s = substr(g, RSTART + 7, RLENGTH - 9)
+    if (match(g, /ratio=[^ ]+/)) r = substr(g, RSTART + 6, RLENGTH - 6)
+    if (match(g, /write_GBps=[^ ]+/)) w = substr(g, RSTART + 11, RLENGTH - 11)
+    if (match(g, /read_GBps=[^ ]+/)) rd = substr(g, RSTART + 10, RLENGTH - 10)
+    if (match(g, /checksum=[^ ]+/)) c = substr(g, RSTART + 9, RLENGTH - 9)
+    printf "%-30s %-6s %-9s %3s %6s %9s %7s %8s %8s %s\n", $1, $3, $4, $5, $6, s, r, w, rd, c
+}' "${RUN}/results.tsv"
+echo "=== GPU 0 peak memory (MiB) / utilisation (%)"
+awk -F', ' '{if ($3 > m) m = $3; if ($4 > u) u = $4} END {print "  " m " MiB, " u "%"}' "${RUN}/gpu.log"
+ts "done"
