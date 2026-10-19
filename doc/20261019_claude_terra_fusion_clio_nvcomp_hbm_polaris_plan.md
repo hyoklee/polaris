@@ -114,5 +114,19 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 
 | Job | Queue | What | Result |
 | --- | --- | --- | --- |
-| 7762190 | debug | clang-CUDA build with compressor + nvCOMP | queued 2026-10-19 |
-| 7762191 | capacity | data prep + smoke + matrix (afterok 7762190) | held on the build |
+| 7762190 | debug | clang-CUDA build with compressor + nvCOMP | exit 2 after 2 min 20 s: issue 1 |
+| 7762191 | capacity | data prep + smoke + matrix (afterok 7762190) | deleted by PBS with the failed build |
+| 7762243 | debug | build, with the issue 1 fix | queued |
+| 7762244 | capacity | data prep + smoke + matrix (afterok 7762243) | held on the build |
+
+## Issues
+
+1. **clio-core bug: the compressor chimod does not link nlohmann_json.**
+   `compressor/src/models/qtable_predictor.cc` includes `nlohmann/json.hpp`,
+   but `clio_cte_compressor_runtime` never links `nlohmann_json::nlohmann_json`,
+   so it builds only where the header is in a system include path (upstream
+   CI). On Polaris it is in `~/deps/nlohmann_json`: `fatal error:
+   nlohmann/json.hpp: No such file or directory`. Fixed by linking the target
+   when it exists, commit e8c5b033 on `polaris-tf-congruence` (local, not
+   pushed). The clang-CUDA toolchain itself configured cleanly: clang 22.1.4,
+   CUDA 12.9.1, nvCOMP 6.0.0.12 found.
