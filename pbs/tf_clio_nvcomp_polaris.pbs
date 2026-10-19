@@ -32,7 +32,8 @@
 #   [3] summary table from the GVS lines
 #
 # Overrides: DATA, TIERS, CODECS, BLOCKS (16), PAGE_KB (256), READ_BATCH (8),
-# RUN_TIMEOUT (600 s), DEADLINE_MIN (stop starting runs when fewer remain).
+# RUN_TIMEOUT (600 s), DEADLINE_MIN (stop starting runs when fewer remain),
+# SMOKE_ONLY=1 (stop after [1]).
 
 set -eo pipefail
 W=/eagle/radix-io/hyoklee/tf
@@ -133,6 +134,9 @@ bench smoke_lz4 synthetic fit lz4
 if ! grep -q 'checksum=OK' "${RUN}/work/smoke_raw/out.log"; then
     ts "ERROR: raw smoke failed; see ${RUN}/work/smoke_raw/out.log"; tail -30 "${RUN}/work/smoke_raw/out.log"; exit 1
 fi
+
+# SMOKE_ONLY=1: stop here (diagnostic runs, e.g. with CLIO_CODEC_TRACE=1).
+[ "${SMOKE_ONLY:-0}" = 1 ] && { ts "SMOKE_ONLY: done"; exit 0; }
 
 # --- [2] matrix -------------------------------------------------------------------
 # Most important first: the decoded arrays (what a GPU consumer reads) with
