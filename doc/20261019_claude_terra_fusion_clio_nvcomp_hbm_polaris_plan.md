@@ -124,8 +124,9 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7762986 | debug | `pbs/tf_clio_nvcomp_diag_polaris.pbs`: lz4/zstd read path split by drainer on/off, batched vs per-page faults, upstream size (256 MB in 512 MB HBM) vs smoke size, all traced | ran 04:20–04:28 UTC; see issue 4 table |
 | 7763029 | debug | `pbs/nvcomp_hlif_probe_polaris.pbs` + `src/tf/nvcomp_hlif_probe.py`: dump nvCOMP 6's native stream header | ran after ~25 min in queue; probe bug (nvCOMP 6 Python takes `uncomp_chunk_size`, not `chunk_size`), no dump |
 | 7763042 | debug | same probe, keyword fixed | **OK**: nvCOMP 6 header layout dumped for 6 codecs (issue 4) |
-| 7763058 | debug | rebuild with the nvCOMP 6 parser fix (c41bb9a9) | submitted |
-| 7763059 | capacity | smoke + full matrix (afterok 7763058) | held on the build |
+| 7763058 | debug | rebuild with the nvCOMP 6 parser fix (c41bb9a9) | exit 1 after 41 s, right after step [3], which had already relinked the compressor runtime (with the fix) and the stream bench. Likely cause: /home over its 45 GB quota (50.8 GB; issue 5), and the job writes its log there |
+| 7763059 | capacity | smoke + full matrix (afterok 7763058) | deleted by PBS with the failed build |
+| 7763065 | capacity | smoke + full matrix, submitted directly on 7763058's step [3] binaries (no other source changed) | submitted |
 
 ## Issues
 
@@ -235,6 +236,16 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    Side findings: the non-batched fallback is too slow to measure anything
    (~1000× slower than raw), and per-page faults with it return wrong data
    (MISMATCH), a second clio-core bug that the batched path would hide.
+
+5. **/home over quota (50.8 GB of 45 GB) on 2026-10-20.** Writes to /home
+   failed, including this file (truncated to 0 bytes mid-edit; restored from
+   git) and most likely the end of build 7763058. Freed 3.9 GB by deleting
+   two Python core dumps (`~/core.2951829`, `~/core.2953113`) from the
+   2026-10-17 GPU-inflate crashes; /home is now at 44.3 GB, still over the
+   soft limit with a 7-day grace period. Other large items are not this
+   task's (`~/clio-core.dev` 14 GB, `~/.apptainer` 12 GB, `~/.npm` 3.9 GB,
+   and a 1 GB `~/cte_client_test.dat` rewritten at 05:23 by another job).
+   All of this task's run output goes to /eagle.
 
 ## Results so far (job 7762244, raw only)
 
