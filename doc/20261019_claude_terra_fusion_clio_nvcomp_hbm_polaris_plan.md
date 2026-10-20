@@ -122,7 +122,8 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7762645 | debug | rebuild with the issue 3 fix (387a711e) | **OK** |
 | 7762647 | capacity | smoke + full matrix (afterok 7762645); stops after the smoke if nvCOMP still fails | 44 s: raw smoke OK; lz4 smoke now **writes all 4096 pages**, then every read fails (issue 4); stopped as designed |
 | 7762986 | debug | `pbs/tf_clio_nvcomp_diag_polaris.pbs`: lz4/zstd read path split by drainer on/off, batched vs per-page faults, upstream size (256 MB in 512 MB HBM) vs smoke size, all traced | ran 04:20–04:28 UTC; see issue 4 table |
-| 7763029 | debug | `pbs/nvcomp_hlif_probe_polaris.pbs` + `src/tf/nvcomp_hlif_probe.py`: dump nvCOMP 6's native stream header | submitted |
+| 7763029 | debug | `pbs/nvcomp_hlif_probe_polaris.pbs` + `src/tf/nvcomp_hlif_probe.py`: dump nvCOMP 6's native stream header | ran after ~25 min in queue; probe bug (nvCOMP 6 Python takes `uncomp_chunk_size`, not `chunk_size`), no dump |
+| 7763042 | debug | same probe, keyword fixed | submitted |
 
 ## Issues
 

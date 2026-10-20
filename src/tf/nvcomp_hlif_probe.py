@@ -26,8 +26,12 @@ print('nvcomp', nvcomp.__version__)
 
 for algo in ['LZ4', 'Snappy', 'Zstd', 'GDeflate', 'Deflate', 'ANS']:
     try:
-        codec = nvcomp.Codec(algorithm=algo, bitstream_kind=nvcomp.BitstreamKind.NVCOMP_NATIVE,
-                             chunk_size=CHUNK)
+        try:
+            codec = nvcomp.Codec(algorithm=algo, bitstream_kind=nvcomp.BitstreamKind.NVCOMP_NATIVE,
+                                 uncomp_chunk_size=CHUNK)
+        except Exception as e:   # keyword differs across nvcomp versions; default chunk is 64 KiB
+            print(f'{algo}: uncomp_chunk_size rejected ({e}); using the default')
+            codec = nvcomp.Codec(algorithm=algo, bitstream_kind=nvcomp.BitstreamKind.NVCOMP_NATIVE)
         enc = codec.encode(nvcomp.as_array(page))
         b = bytes(np.asarray(enc.cpu()).view(np.uint8))
     except Exception as e:   # one codec failing must not hide the others
