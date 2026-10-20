@@ -1,0 +1,62 @@
+#!/bin/bash
+#PBS -N tf_clio_nvcomp_diag
+#PBS -l select=1:system=polaris
+#PBS -l walltime=00:30:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/tf_clio_nvcomp_diag_polaris.log
+#
+# Issue 4 of doc/20261019_claude_terra_fusion_clio_nvcomp_hbm_polaris_plan.md:
+# with create_on_get_ fixed the nvCOMP write pass completes, but every read
+# fails with "GPU-compressed blob ... could not be served by the codec
+# context". This splits the read path: batched drainer on/off, batched vs
+# per-page faults, upstream's RESULTS.md size (256 MB in a 512 MB HBM tier)
+# vs our smoke size, lz4 vs zstd. Every case runs with CLIO_CODEC_TRACE=1.
+
+set -o pipefail
+W=/eagle/radix-io/hyoklee/tf
+BIN=${BIN:-${W}/build_tf_nvcomp/bin}
+JOBID=${PBS_JOBID%%.*}
+RUN=${W}/tf_clio_nvcomp/diag_${JOBID:-manual}
+CUDA_ROOT=/soft/compilers/cudatoolkit/cuda-12.9.1
+NVCOMP_ROOT=${W}/venv-tf/lib/python3.12/site-packages/nvidia/libnvcomp
+export LD_LIBRARY_PATH=${BIN}:${CUDA_ROOT}/lib64:${NVCOMP_ROOT}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export CTP_LOG_LEVEL=${CTP_LOG_LEVEL:-info}
+mkdir -p "$RUN"
+exec > >(tee -a "$RUN/job.log") 2>&1
+echo "[$(date +%T)] host=$(hostname) clio-core: $(git -C /home/hyoklee/clio-core.dev.tf log --oneline -1)"
+
+case_() {   # case_ <label> <env...> -- <bench args...>
+    local label=$1; shift
+    local envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
+    local d="${RUN}/${label}"; mkdir -p "$d"
+    echo "${envs[*]} clio_gpu_vector_stream_bench $*" > "$d/cmd"
+    local t0=$SECONDS
+    (cd "$d" && env CUDA_VISIBLE_DEVICES=0 CLIO_CODEC_TRACE=1 "${envs[@]}" \
+        timeout -k 20 180 "${BIN}/clio_gpu_vector_stream_bench" "$@") > "$d/out.log" 2>&1
+    local rc=$?
+    echo "[$(date +%T)] ${label}: rc=$rc $((SECONDS - t0))s" \
+         "$(grep -m1 '^GVS ' "$d/out.log" | grep -oE '(ratio|write_GBps|read_GBps|checksum)=[^ ]+' | tr '\n' ' ')" \
+         "served_err=$(grep -c 'could not be served' "$d/out.log")" \
+         "timeouts=$(grep -c 'waiter TIMEOUT' "$d/out.log")" \
+         "refused=$(grep -c 'REFUSED' "$d/out.log")"
+    for _ in $(seq 1 20); do
+        [ "$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')" -lt 1000 ] && break
+        sleep 1
+    done
+}
+
+S=(--total-mb 256 --zero-pct 30 --tier-type hbm --vram-mb 512 --spill-type ram --spill-mb 2048 --blocks 16 --page-kb 256)
+L=(--total-mb 1024 --zero-pct 30 --tier-type hbm --vram-mb 1536 --spill-type ram --spill-mb 2048 --blocks 16 --page-kb 256)
+case_ s_raw                              -- "${S[@]}" --read-batch 8
+case_ s_lz4_batch                        -- "${S[@]}" --read-batch 8 --codec lz4
+case_ s_lz4_nobatch CLIO_COMPRESS_GPU_BATCH=0 -- "${S[@]}" --read-batch 8 --codec lz4
+case_ s_lz4_rb0                          -- "${S[@]}" --read-batch 0 --codec lz4
+case_ s_lz4_rb0_nobatch CLIO_COMPRESS_GPU_BATCH=0 -- "${S[@]}" --read-batch 0 --codec lz4
+case_ s_zstd_batch                       -- "${S[@]}" --read-batch 8 --codec zstd
+case_ l_lz4_nobatch CLIO_COMPRESS_GPU_BATCH=0 -- "${L[@]}" --read-batch 8 --codec lz4
+case_ l_lz4_rb0                          -- "${L[@]}" --read-batch 0 --codec lz4
+echo "[$(date +%T)] done: $RUN"

@@ -119,8 +119,9 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7762243 | debug | build, with the issue 1 fix | **OK**, 71 s (most objects reused); waited ~1 h in the debug queue |
 | 7762244 | capacity | data prep + smoke + matrix (afterok 7762243) | ran 22:45–23:25 UTC, 40 min: **every raw run OK, every nvCOMP run crashed** (issue 3) |
 | 7762577 | debug | smoke only, `CLIO_CODEC_TRACE=1 CLIO_DR_LOG=1 CTP_LOG_LEVEL=info` (issue 3) | raw OK, lz4 same trap; no multi-get ever reached the core → cause found (issue 3) |
-| 7762645 | debug | rebuild with the issue 3 fix (387a711e) | queued |
-| 7762647 | capacity | smoke + full matrix (afterok 7762645); stops after the smoke if nvCOMP still fails | held on the build |
+| 7762645 | debug | rebuild with the issue 3 fix (387a711e) | **OK** |
+| 7762647 | capacity | smoke + full matrix (afterok 7762645); stops after the smoke if nvCOMP still fails | 44 s: raw smoke OK; lz4 smoke now **writes all 4096 pages**, then every read fails (issue 4); stopped as designed |
+| 7762986 | debug | `pbs/tf_clio_nvcomp_diag_polaris.pbs`: lz4/zstd read path split by drainer on/off, batched vs per-page faults, upstream size (256 MB in 512 MB HBM) vs smoke size, all traced | submitted |
 
 ## Issues
 
@@ -164,6 +165,19 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    **Fix:** when the size lookup fails and `create_on_get_` is set, forward the
    get to the core as the raw path does. Commit 387a711e on
    `polaris-tf-congruence` (local, not pushed).
+   **Verified** by job 7762647: the lz4 write pass now completes
+   (`GVSTAT-WRITE faults=4096 puts=4096 get_errors=0`).
+
+4. **nvCOMP reads fail: "GPU-compressed blob could not be served by the codec
+   context".** Same job, read pass: `DecompressPodGetBlob`
+   (`compressor_runtime.cc:3510`) logs this for every page, the gpu_vector
+   fetch is REFUSED, and the kernel traps (CUDA 719, segfault in teardown).
+   That error is the compressor's deliberate guard: a GPU-compressed page that
+   the batched drainer did not decode (drainer reported `ok=false`, or the
+   waiter's 2 s budget ran out) must not fall back to the CPU. So the decode
+   itself, not the store, is failing. Candidates: the nvCOMP 6.0 pip wheel
+   (upstream measured with an older nvCOMP), the clang-CUDA build, or the
+   drainer under our tier sizes. Job 7762986 splits these.
 
 ## Results so far (job 7762244, raw only)
 
