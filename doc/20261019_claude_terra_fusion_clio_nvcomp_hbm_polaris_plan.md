@@ -252,6 +252,17 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    (`context-transfer-engine/test/unit/test_core_client_config.cc:82`,
    `$HOME/cte_client_test.dat`), so the 3-hourly clio_core runner will
    recreate it in /home on its next test run.
+   **Fix:** clio-core commit 843290d6 on branch
+   `fix/test-core-client-tmpdir` (worktree
+   `/eagle/radix-io/hyoklee/clio-core.fix-test-tmpdir`, from `origin/dev`
+   e7e409d0; local, not pushed) puts the test's files in
+   `std::filesystem::temp_directory_path()` (`TMPDIR`, else `/tmp`), with home
+   only as a fallback. The runner's `ctest -D Continuous` resets
+   `~/clio-core.dev` to `origin/dev` before each build, so the runner gets the
+   fix only once it is merged upstream. Other tests that still write under home:
+   test_query, test_reorganize_blob, test_tag_operations,
+   test_tiered_storage_stress, test_core_functionality_simple,
+   test_fuse_adapter, test_cae_comprehensive.
 
 ## Results so far (job 7762244, raw only)
 
