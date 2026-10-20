@@ -123,7 +123,9 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7762647 | capacity | smoke + full matrix (afterok 7762645); stops after the smoke if nvCOMP still fails | 44 s: raw smoke OK; lz4 smoke now **writes all 4096 pages**, then every read fails (issue 4); stopped as designed |
 | 7762986 | debug | `pbs/tf_clio_nvcomp_diag_polaris.pbs`: lz4/zstd read path split by drainer on/off, batched vs per-page faults, upstream size (256 MB in 512 MB HBM) vs smoke size, all traced | ran 04:20–04:28 UTC; see issue 4 table |
 | 7763029 | debug | `pbs/nvcomp_hlif_probe_polaris.pbs` + `src/tf/nvcomp_hlif_probe.py`: dump nvCOMP 6's native stream header | ran after ~25 min in queue; probe bug (nvCOMP 6 Python takes `uncomp_chunk_size`, not `chunk_size`), no dump |
-| 7763042 | debug | same probe, keyword fixed | submitted |
+| 7763042 | debug | same probe, keyword fixed | **OK**: nvCOMP 6 header layout dumped for 6 codecs (issue 4) |
+| 7763058 | debug | rebuild with the nvCOMP 6 parser fix (c41bb9a9) | submitted |
+| 7763059 | capacity | smoke + full matrix (afterok 7763058) | held on the build |
 
 ## Issues
 
@@ -208,6 +210,27 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    (`cmake/ClioNvcompDevice.cmake`); Polaris only has nvCOMP 6.0.0.12 (pip
    wheel). Job 7763029 dumps nvCOMP 6's header to confirm and get the new
    offsets.
+
+   **Cause (confirmed by job 7763042, nvCOMP 6.0.0.12 native headers for
+   lz4/snappy/zstd/gdeflate/deflate/ans):**
+
+   | Field (offset in the nvCOMP stream) | clio-core's parser (nvCOMP 5) | nvCOMP 6.0 |
+   | --- | --- | --- |
+   | magic | `0x52911326` | `0x52911327` |
+   | payload bytes | — | +8 |
+   | original size / chunk count | +16 / +24 | +16 / +24 |
+   | chunk size | +48 | **+32** |
+   | data start | +56, must be 72 + 16n | **+40**: 128 (zstd, snappy, gdeflate, deflate), 136 (lz4), 144 (ans) |
+   | chunk offset / size tables | +72 | after a codec format-spec header at +56 (4–16 B, sizes as in nvCOMP 6's public `formatSpec.hpp`): +64, or +72 for lz4/ans |
+   | chunk padding | — | 8 B (16 B for ans) |
+
+   **Fix:** commit c41bb9a9 adds an nvCOMP 6 branch to `ParseBlobChunks`. It
+   reads the new fields and finds the tables by requiring that the chunk
+   offsets and sizes exactly tile the payload length at +8. Checked on the
+   login node against all six dumped headers (correct chunk addresses, and a
+   corrupted data-start field is rejected) before rebuilding. The nvCOMP 5
+   path is unchanged. Local only; worth sending upstream together with
+   issue 3's fix, since any site using the current nvCOMP hits this.
 
    Side findings: the non-batched fallback is too slow to measure anything
    (~1000× slower than raw), and per-page faults with it return wrong data
