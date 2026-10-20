@@ -121,7 +121,8 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7762577 | debug | smoke only, `CLIO_CODEC_TRACE=1 CLIO_DR_LOG=1 CTP_LOG_LEVEL=info` (issue 3) | raw OK, lz4 same trap; no multi-get ever reached the core → cause found (issue 3) |
 | 7762645 | debug | rebuild with the issue 3 fix (387a711e) | **OK** |
 | 7762647 | capacity | smoke + full matrix (afterok 7762645); stops after the smoke if nvCOMP still fails | 44 s: raw smoke OK; lz4 smoke now **writes all 4096 pages**, then every read fails (issue 4); stopped as designed |
-| 7762986 | debug | `pbs/tf_clio_nvcomp_diag_polaris.pbs`: lz4/zstd read path split by drainer on/off, batched vs per-page faults, upstream size (256 MB in 512 MB HBM) vs smoke size, all traced | submitted |
+| 7762986 | debug | `pbs/tf_clio_nvcomp_diag_polaris.pbs`: lz4/zstd read path split by drainer on/off, batched vs per-page faults, upstream size (256 MB in 512 MB HBM) vs smoke size, all traced | ran 04:20–04:28 UTC; see issue 4 table |
+| 7763029 | debug | `pbs/nvcomp_hlif_probe_polaris.pbs` + `src/tf/nvcomp_hlif_probe.py`: dump nvCOMP 6's native stream header | submitted |
 
 ## Issues
 
@@ -178,6 +179,38 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    itself, not the store, is failing. Candidates: the nvCOMP 6.0 pip wheel
    (upstream measured with an older nvCOMP), the clang-CUDA build, or the
    drainer under our tier sizes. Job 7762986 splits these.
+
+   Job 7762986 (synthetic, 30% zeros, 256 MB in a 512 MB HBM tier = upstream's
+   0.5× row; `l_` = our 1 GB smoke size):
+
+   | Case | Batched drainer | Reads | Result |
+   | --- | --- | --- | --- |
+   | s_raw | — | batch 8 | OK, write 0.39 / read 0.19 GB/s |
+   | s_lz4_batch | on | batch 8 | rc 1 in 8 s: 18 "could not be served", 0 waiter timeouts |
+   | s_lz4_nobatch | off | batch 8 | **checksum OK**, ratio 1.41× (= upstream), but read 146 s (0.002 GB/s) |
+   | s_lz4_rb0 | on | per page | crash (rc 139), same error |
+   | s_lz4_rb0_nobatch | off | per page | rc 1, **checksum MISMATCH**, read 58 s |
+   | s_zstd_batch | on | batch 8 | rc 1, same error |
+   | l_lz4_nobatch | off | batch 8 | killed at the 180 s limit |
+   | l_lz4_rb0 | on | per page | crash, same error |
+
+   Reading the trace: the drainer gathers batches, but **no batch is ever
+   launched** (no `[DRAIN] launched` line in any run), and no waiter times out,
+   so every batch is rejected before nvCOMP is called. Pages are written
+   correctly (the non-batched manager-API decode returns them with a good
+   checksum), so the store is fine. In `LaunchDecompBatch` the one rejection
+   that fits is `wire == 0 || nch == 0`, i.e. `ParseBlobChunks` failed for
+   every page. That function hard-codes nvCOMP's **internal** native-stream
+   header (magic `0x52911326`, then the original size, chunk count, chunk size
+   and data offset at fixed byte offsets). That layout is not in nvCOMP's
+   public headers and clio-core was written against nvCOMP 5.2
+   (`cmake/ClioNvcompDevice.cmake`); Polaris only has nvCOMP 6.0.0.12 (pip
+   wheel). Job 7763029 dumps nvCOMP 6's header to confirm and get the new
+   offsets.
+
+   Side findings: the non-batched fallback is too slow to measure anything
+   (~1000× slower than raw), and per-page faults with it return wrong data
+   (MISMATCH), a second clio-core bug that the batched path would hide.
 
 ## Results so far (job 7762244, raw only)
 

@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N nvcomp_hlif_probe
+#PBS -l select=1:system=polaris
+#PBS -l walltime=00:10:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/nvcomp_hlif_probe_polaris.log
+#
+# Dump nvCOMP 6's NVCOMP_NATIVE header layout (issue 4 of
+# doc/20261019_claude_terra_fusion_clio_nvcomp_hbm_polaris_plan.md).
+module use /soft/modulefiles > /dev/null 2>&1
+module load conda > /dev/null 2>&1
+W=/eagle/radix-io/hyoklee/tf
+CUDA_VISIBLE_DEVICES=0 ${W}/venv-tf/bin/python /home/hyoklee/polaris/src/tf/nvcomp_hlif_probe.py
