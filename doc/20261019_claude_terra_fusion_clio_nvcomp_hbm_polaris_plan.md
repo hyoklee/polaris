@@ -271,10 +271,29 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    kernel traps (CUDA 719 follows). With issue 4 fixed, the chunk tables parse
    (the parser requires them to tile the payload exactly), so the
    `nvcompBatched{Zstd,Deflate}DecompressAsync` call itself returns a bad
-   status or size for these two codecs. Most likely an nvCOMP 6 API difference
-   in clio-core's batched decompress wrapper (decompress options, temp-size
-   arguments). Not fixed. The next step would be a traced run
-   (`CLIO_CODEC_TRACE=1`, whose `[RETIRE]` lines print the per-chunk status).
+   status or size for these two codecs.
+
+   **Cause: clio-core's batched dispatch has the two wire ids swapped.**
+   `NvcompBatchedTempSizeImpl` and `NvcompBatchedDecompressImpl`
+   (`compressor_runtime.cc`, the `CLIO_NVC_CASE_*` switches) map wire 13 to
+   Deflate and 15 to Zstd. But `CompressionFactory::kRegistry`
+   (`compress_factory.h:599,601`) and `test_compress.cc:304,306` define 13 as
+   `nvcomp-zstd` and 15 as `nvcomp-deflate`. So every zstd page was decoded by
+   nvCOMP's Deflate decoder, and every deflate page by the Zstd decoder. lz4
+   (11), gdeflate (14) and ans (16) are mapped correctly, which is why only
+   they worked. Upstream `dev` (e7e409d0) has the same swap. How it was found:
+
+   | Step | Job | Result |
+   | --- | --- | --- |
+   | Temp-size theory: clio-core passes `max_total_uncompressed_bytes = 0` | 7763605, standalone probe (`src/nvcomp_probe/nvcomp_temp_probe.cu`) | Wrong: every codec's temp size is the same with 0 or the real total, and batched zstd and deflate decode 32 × 64 KiB chunks correctly |
+   | Traced bench run (`pbs/tf_clio_nvcomp_diag6_polaris.pbs`) | 7763607 | Pages are stored correctly: the per-page manager decode (`CLIO_COMPRESS_GPU_BATCH=0`) returns them with a good checksum. On the batched path every zstd chunk returns status 11 (`nvcompErrorNotSupported`). Deflate batches never launch; the drainer stalls 5.7 s and its waiters time out |
+   | All-zero chunks (a zstd zero page is 20 B per chunk) | 7763622, probe | nvCOMP decodes them fine (3277×) |
+   | Input alignment (zstd needs 8 B) | 7763623, probe | Zstd and deflate decode with inputs shifted 4 or 8 B. Side finding: ANS faults on a 4 B shift (CUDA 716, misaligned address), as its 16 B requirement says |
+   | Trace line `[GENERIC] gwire=13` in the zstd run | 7763607 | 13 is `nvcomp-zstd` in the registry, but the switch sends 13 to Deflate |
+
+   **Fix:** commit 9fb7c833 on `polaris-tf-congruence` swaps the two cases.
+   Verification: rebuild 7763627, then diag6 on the synthetic cells plus the
+   full run's A_O33737 zstd/deflate fit cells.
 
 7. **lz4 on A_O18825 livelocks in the write pass** (fit, dram, host; the
    lustre cell passed). After 2,000,000 relaunch rounds the bench reports

@@ -1,0 +1,29 @@
+#!/bin/bash
+#PBS -N nvcomp_temp_probe
+#PBS -l select=1:system=polaris
+#PBS -l walltime=00:10:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/nvcomp_temp_probe_polaris.log
+#
+# Issue 6 of doc/20261019_claude_terra_fusion_clio_nvcomp_hbm_polaris_plan.md:
+# decompress temp size with max_total_uncompressed_bytes = 0 (clio-core) vs
+# the real total, per codec. Each run is its own process so a sticky CUDA
+# fault cannot leak into the next. DATA picks the input patterns (all-zero
+# chunks are what clio-core's failing zstd batches hold); SHIFTS offsets the
+# compressed inputs by that many bytes to test alignment.
+P=/eagle/radix-io/hyoklee/tf/nvcomp_probe/nvcomp_temp_probe
+export LD_LIBRARY_PATH=/soft/compilers/cudatoolkit/cuda-12.9.1/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+nvidia-smi -L | head -1
+for d in ${DATA:-smooth zeros mixed}; do
+  for c in lz4 gdeflate ans deflate zstd; do
+    for m in ${MODES:-total zero}; do
+      for sh in ${SHIFTS:-0}; do
+        echo "=== $c $m $d shift=$sh"
+        PROBE_SHIFT=$sh CUDA_VISIBLE_DEVICES=0 timeout 60 $P $c $m $d; echo "exit=$?"
+      done
+    done
+  done
+done

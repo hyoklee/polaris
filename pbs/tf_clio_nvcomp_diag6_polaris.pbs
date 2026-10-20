@@ -1,0 +1,69 @@
+#!/bin/bash
+#PBS -N tf_clio_nvcomp_diag6
+#PBS -l select=1:system=polaris
+#PBS -l walltime=00:30:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/tf_clio_nvcomp_diag6_polaris.log
+#
+# Issue 6 of doc/20261019_claude_terra_fusion_clio_nvcomp_hbm_polaris_plan.md
+# (cause: batched dispatch swapped wire ids 13/15, fixed in 9fb7c833; set
+# REAL=1 to add the full run's failing A_O33737 zstd/deflate cells):
+# with the nvCOMP 6 header parse fixed, lz4/gdeflate/ans decode but every
+# zstd and deflate read fails. A standalone batched-API probe (job 7763605)
+# decodes zstd and deflate fine, so this captures clio-core's per-chunk
+# nvcomp status ([RETIRE] lines) on the batched path and tries the per-page
+# path, with gdeflate as the passing control. Every case runs with
+# CLIO_CODEC_TRACE=1.
+set -o pipefail
+W=/eagle/radix-io/hyoklee/tf
+BIN=${BIN:-${W}/build_tf_nvcomp/bin}
+JOBID=${PBS_JOBID%%.*}
+RUN=${W}/tf_clio_nvcomp/diag6_${JOBID:-manual}
+CUDA_ROOT=/soft/compilers/cudatoolkit/cuda-12.9.1
+NVCOMP_ROOT=${W}/venv-tf/lib/python3.12/site-packages/nvidia/libnvcomp
+export LD_LIBRARY_PATH=${BIN}:${CUDA_ROOT}/lib64:${NVCOMP_ROOT}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export CTP_LOG_LEVEL=${CTP_LOG_LEVEL:-info}
+mkdir -p "$RUN"
+exec > >(tee -a "$RUN/job.log") 2>&1
+echo "[$(date +%T)] host=$(hostname) clio-core: $(git -C /home/hyoklee/clio-core.dev.tf log --oneline -1)"
+
+case_() {   # case_ <label> <env...> -- <bench args...>
+    local label=$1; shift
+    local envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
+    local d="${RUN}/${label}"; mkdir -p "$d"
+    echo "${envs[*]} clio_gpu_vector_stream_bench $*" > "$d/cmd"
+    local t0=$SECONDS
+    (cd "$d" && env CUDA_VISIBLE_DEVICES=0 CLIO_CODEC_TRACE=1 "${envs[@]}" \
+        timeout -k 20 180 "${BIN}/clio_gpu_vector_stream_bench" "$@") > "$d/out.log" 2>&1
+    local rc=$?
+    echo "[$(date +%T)] ${label}: rc=$rc $((SECONDS - t0))s" \
+         "$(grep -m1 '^GVS ' "$d/out.log" | grep -oE '(ratio|write_GBps|read_GBps|checksum)=[^ ]+' | tr '\n' ' ')" \
+         "served_err=$(grep -c 'could not be served' "$d/out.log")" \
+         "timeouts=$(grep -c 'waiter TIMEOUT' "$d/out.log")" \
+         "refused=$(grep -c 'REFUSED' "$d/out.log")"
+    for _ in $(seq 1 20); do
+        [ "$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')" -lt 1000 ] && break
+        sleep 1
+    done
+}
+
+S=(--total-mb 256 --zero-pct 30 --tier-type hbm --vram-mb 512 --spill-type ram --spill-mb 2048 --blocks 16 --page-kb 256)
+L=(--total-mb 1024 --zero-pct 30 --tier-type hbm --vram-mb 1536 --spill-type ram --spill-mb 2048 --blocks 16 --page-kb 256)
+case_ s_gdeflate_batch                   -- "${S[@]}" --read-batch 8 --codec gdeflate
+case_ s_zstd_batch                       -- "${S[@]}" --read-batch 8 --codec zstd
+case_ s_deflate_batch                    -- "${S[@]}" --read-batch 8 --codec deflate
+case_ s_zstd_rb0                         -- "${S[@]}" --read-batch 0 --codec zstd
+case_ s_deflate_rb0                      -- "${S[@]}" --read-batch 0 --codec deflate
+# The full run's failing cells, on real data (A_O33737, HBM tier fits all).
+if [ -n "${REAL:-}" ]; then
+    # Same arguments as run_7763065/work/A_O33737_fit_<codec>/cmd.
+    A=(--data-file ${W}/tf_clio_nvcomp/data/A_O33737.bin --total-mb 1962 --tier-type hbm --vram-mb 2708 --spill-type ram --spill-mb 3924 --blocks 16 --page-kb 256 --read-batch 8)
+    for c in zstd deflate; do
+        case_ a_${c}_fit -- "${A[@]}" --codec $c
+    done
+fi
+echo "[$(date +%T)] done: $RUN"
