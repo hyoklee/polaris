@@ -126,7 +126,7 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7763042 | debug | same probe, keyword fixed | **OK**: nvCOMP 6 header layout dumped for 6 codecs (issue 4) |
 | 7763058 | debug | rebuild with the nvCOMP 6 parser fix (c41bb9a9) | exit 1 after 41 s, right after step [3], which had already relinked the compressor runtime (with the fix) and the stream bench. Likely cause: /home over its 45 GB quota (50.8 GB; issue 5), and the job writes its log there |
 | 7763059 | capacity | smoke + full matrix (afterok 7763058) | deleted by PBS with the failed build |
-| 7763065 | capacity | smoke + full matrix, submitted directly on 7763058's step [3] binaries (no other source changed) | submitted |
+| 7763065 | capacity | smoke + full matrix, submitted directly on 7763058's step [3] binaries (no other source changed) | ran 05:34–07:11 UTC, 1 h 37 min. **First nvCOMP results**: lz4, gdeflate and ans pass the checksum in every tier; zstd and deflate fail every read (issue 6); lz4 on A_O18825 livelocks in 3 of 4 tiers (issue 7) |
 
 ## Issues
 
@@ -264,7 +264,116 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    test_tiered_storage_stress, test_core_functionality_simple,
    test_fuse_adapter, test_cae_comprehensive.
 
-## Results so far (job 7762244, raw only)
+6. **zstd and deflate: every batched GPU decode fails (nvCOMP 6).** Job
+   7763065, all 22 zstd/deflate cells. The write pass completes (e.g.
+   `GVSTAT-WRITE faults=7840 puts=7840 get_errors=0`). Then every read logs
+   "GPU-compressed blob ... could not be served by the codec context" and the
+   kernel traps (CUDA 719 follows). With issue 4 fixed, the chunk tables parse
+   (the parser requires them to tile the payload exactly), so the
+   `nvcompBatched{Zstd,Deflate}DecompressAsync` call itself returns a bad
+   status or size for these two codecs. Most likely an nvCOMP 6 API difference
+   in clio-core's batched decompress wrapper (decompress options, temp-size
+   arguments). Not fixed. The next step would be a traced run
+   (`CLIO_CODEC_TRACE=1`, whose `[RETIRE]` lines print the per-chunk status).
+
+7. **lz4 on A_O18825 livelocks in the write pass** (fit, dram, host; the
+   lustre cell passed). After 2,000,000 relaunch rounds the bench reports
+   "ROUND CAP HIT ... 16 block(s) still suspended -- faults are not being
+   satisfied" (`GVSTAT-WRITE faults=8994 puts=8978`: one unsatisfied fault per
+   block). The run then hits the 600 s limit (rc 124). It happens only with
+   lz4 on the larger granule's arrays (2652 MB), so it is load dependent. Not
+   investigated.
+
+## Results: CLIO nvCOMP GPU tiering (job 7763065, 2026-10-20)
+
+clio-core c41bb9a9 (origin/dev 03c4ba2b + the local fixes for issues 1–4),
+nvCOMP 6.0.0.12, A100-40GB GPU 0. 16 blocks × 8 slots, 256 KiB pages,
+batched reads of 8 pages. Each cell is one process: a write pass (pages
+compressed on the GPU into the tier) then a cold read pass (decoded on the
+GPU, device to device, into the consumer's page). Ratio is logical / stored
+bytes; GB/s are logical bytes. Every number shown passed the
+position-weighted checksum. Tiers: **fit** = HBM top tier holds everything;
+**dram** / **lustre** = HBM holds ¼ of the raw size, the rest spills to DRAM
+or a file on /eagle; **host** = pinned host memory, no HBM. A_ = the decoded
+arrays the congruence pipeline reads; H_ = 2 GiB of the granule's stored
+(already deflated) bytes. The H_ files ran only in fit and dram.
+
+**A_O33737** (ratio · write / read GB/s)
+
+| Codec | fit | dram | lustre | host |
+| --- | --- | --- | --- | --- |
+| raw | 1.00x · 0.27 / 0.26 | 1.00x · 0.27 / 0.28 | 1.00x · 0.25 / 0.24 | 1.00x · 0.15 / 0.26 |
+| lz4 | 1.36x · 0.03 / 0.27 | 1.36x · 0.03 / 0.25 | 1.36x · 0.03 / 0.16 | 1.36x · 0.03 / 0.25 |
+| gdeflate | 1.65x · 0.05 / 0.27 | 1.65x · 0.05 / 0.28 | 1.65x · 0.04 / 0.19 | 1.65x · 0.04 / 0.23 |
+| ans | 1.22x · 0.23 / 0.30 | 1.22x · 0.21 / 0.26 | 1.22x · 0.08 / 0.14 | 1.22x · 0.20 / 0.25 |
+| zstd | fail rc 1 | fail rc 139 | fail rc 134 | fail rc 1 |
+| deflate | fail rc 134 | fail rc 134 | fail rc 139 | fail rc 134 |
+
+**A_O18825** (ratio · write / read GB/s)
+
+| Codec | fit | dram | lustre | host |
+| --- | --- | --- | --- | --- |
+| raw | 1.00x · 0.24 / 0.28 | 1.00x · 0.28 / 0.26 | 1.00x · 0.23 / 0.25 | 1.00x · 0.24 / 0.27 |
+| lz4 | timeout (livelock) | timeout (livelock) | 1.30x · 0.02 / 0.17 | timeout (livelock) |
+| gdeflate | 1.57x · 0.05 / 0.25 | 1.57x · 0.05 / 0.27 | 1.57x · 0.04 / 0.19 | 1.57x · 0.04 / 0.25 |
+| ans | 1.19x · 0.18 / 0.29 | 1.19x · 0.16 / 0.28 | 1.19x · 0.09 / 0.14 | 1.19x · 0.22 / 0.26 |
+| zstd | fail rc 1 | fail rc 1 | fail rc 139 | fail rc 1 |
+| deflate | fail rc 139 | fail rc 139 | fail rc 139 | fail rc 1 |
+
+**H_O33737** (ratio · write / read GB/s)
+
+| Codec | fit | dram |
+| --- | --- | --- |
+| raw | 1.00x · 0.28 / 0.24 | 1.00x · 0.21 / 0.32 |
+| lz4 | 1.00x · 0.06 / 0.28 | 1.00x · 0.05 / 0.29 |
+| gdeflate | 1.03x · 0.07 / 0.28 | 1.03x · 0.08 / 0.23 |
+| ans | 1.03x · 0.18 / 0.25 | 1.03x · 0.21 / 0.27 |
+| zstd | fail rc 134 | fail rc 134 |
+| deflate | fail rc 139 | fail rc 134 |
+
+**H_O18825** (ratio · write / read GB/s)
+
+| Codec | fit | dram |
+| --- | --- | --- |
+| raw | 1.00x · 0.15 / 0.25 | 1.00x · 0.38 / 0.26 |
+| lz4 | 1.00x · 0.06 / 0.31 | 1.00x · 0.06 / 0.27 |
+| gdeflate | 1.02x · 0.08 / 0.27 | 1.02x · 0.07 / 0.27 |
+| ans | 1.01x · 0.25 / 0.28 | 1.01x · 0.23 / 0.29 |
+| zstd | fail rc 1 | fail rc 1 |
+| deflate | fail rc 139 | fail rc 139 |
+
+
+Extra cells: A_O33737 fit raw with per-page faults (`--read-batch 0`):
+write 0.33, read **2.52 GB/s**; the same with zstd failed (issue 6).
+
+**What it says**
+
+* **CLIO's GPU tiering with nvCOMP works on Polaris** for lz4, gdeflate and
+  ans: GPU compression on write, storage in HBM (or spilled), and GPU
+  decompression straight into the consumer's page, with correct data in every
+  tier.
+* **Read rate does not depend on the codec or the tier:** 0.25–0.30 GB/s in
+  fit, dram and host, raw or compressed, and 0.14–0.19 GB/s with Lustre spill.
+  As with the raw-only run, the per-fault round trip through the CPU runtime
+  sets the rate, not HBM, the PCIe link or the decoder. The same data
+  read with per-page faults reaches 2.52 GB/s raw, so batched faulting is
+  still the bottleneck (see the earlier raw-only results below).
+* **On the decoded arrays (A_) compression saves HBM:** gdeflate stores
+  1.57–1.65×, lz4 1.30–1.36×, ans 1.19–1.22×, at no cost to reads. On the
+  granules' stored bytes (H_) nothing compresses (1.00–1.03×), as the earlier
+  CPU measurements predicted: those bytes are already deflated.
+* **Writes pay for the GPU compression:** lz4 0.02–0.06 and gdeflate
+  0.04–0.08 GB/s, against 0.15–0.38 GB/s raw, so 5–9× slower. ans is almost
+  free (0.16–0.25 GB/s) while still saving 1.2×.
+* **GPU use:** GPU 0 peaked at 19.0 GB of HBM at 100% utilisation
+  (`gpu.log`, 06:00 UTC, during A_O18825).
+* With these sizes nothing needed to spill once compressed (fit is fit
+  either way), so this run cannot show the regime where upstream's
+  `RESULTS.md` finds compression ahead (data 2–4× the top tier, spill tier
+  throttled). The dram/lustre cells hold only ¼ of the raw size in HBM, and
+  the gain there is hidden by the fault-path limit above.
+
+## Earlier results (job 7762244, raw only)
 
 GB/s of logical bytes; 16 blocks × 8 slots, 256 KiB pages, batched reads of 8
 pages unless noted. Every row passed the position-weighted checksum.
