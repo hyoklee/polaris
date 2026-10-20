@@ -136,6 +136,13 @@ if ! grep -q 'checksum=OK' "${RUN}/work/smoke_raw/out.log"; then
 fi
 
 # SMOKE_ONLY=1: stop here (diagnostic runs, e.g. with CLIO_CODEC_TRACE=1).
+# A failed nvCOMP smoke means every codec cell would fail the same way (job
+# 7762244 spent 40 min learning that), so stop unless ALLOW_CODEC_FAIL=1.
+if ! grep -q 'checksum=OK' "${RUN}/work/smoke_lz4/out.log" && [ "${ALLOW_CODEC_FAIL:-0}" != 1 ]; then
+    ts "ERROR: nvcomp smoke failed; see ${RUN}/work/smoke_lz4/out.log"
+    grep -m3 -E 'FATAL|ERROR' "${RUN}/work/smoke_lz4/out.log" | cut -c1-200
+    exit 1
+fi
 [ "${SMOKE_ONLY:-0}" = 1 ] && { ts "SMOKE_ONLY: done"; exit 0; }
 
 # --- [2] matrix -------------------------------------------------------------------

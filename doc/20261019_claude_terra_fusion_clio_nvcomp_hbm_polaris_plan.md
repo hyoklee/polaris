@@ -118,7 +118,9 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7762191 | capacity | data prep + smoke + matrix (afterok 7762190) | deleted by PBS with the failed build |
 | 7762243 | debug | build, with the issue 1 fix | **OK**, 71 s (most objects reused); waited ~1 h in the debug queue |
 | 7762244 | capacity | data prep + smoke + matrix (afterok 7762243) | ran 22:45–23:25 UTC, 40 min: **every raw run OK, every nvCOMP run crashed** (issue 3) |
-| 7762577 | debug | smoke only, `CLIO_CODEC_TRACE=1 CLIO_DR_LOG=1 CTP_LOG_LEVEL=info` (issue 3) | queued |
+| 7762577 | debug | smoke only, `CLIO_CODEC_TRACE=1 CLIO_DR_LOG=1 CTP_LOG_LEVEL=info` (issue 3) | raw OK, lz4 same trap; no multi-get ever reached the core → cause found (issue 3) |
+| 7762645 | debug | rebuild with the issue 3 fix (387a711e) | queued |
+| 7762647 | capacity | smoke + full matrix (afterok 7762645); stops after the smoke if nvCOMP still fails | held on the build |
 
 ## Issues
 
@@ -148,8 +150,20 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    first-touch get of a page that does not exist yet comes back non-zero.
    `RESULTS.md`'s compressed numbers predate that commit. So this is likely a
    clio-core regression in the compressed gpu_vector path, not a Polaris
-   problem. To be confirmed by a traced rerun (`CLIO_CODEC_TRACE=1
-   CLIO_DR_LOG=1`).
+   problem.
+
+   **Cause (confirmed by reading the code after the traced job 7762577 showed
+   no multi-get reaching the core):** gpu_vector's fetch sets
+   `context_.create_on_get_ = true` ("a page nobody has written yet has no
+   blob; the CTE creates it and returns success"). Uncompressed gets go
+   straight to the core, which honours that. But
+   `Runtime::DecompressPodGetBlob` in the compressor first asks the core for
+   `GetBlobSize`. A page that was never written has none, so the compressor
+   returns an error and never forwards the get. Every first write of a
+   compressed vector therefore fails, and since 2fb27726 that traps the kernel.
+   **Fix:** when the size lookup fails and `create_on_get_` is set, forward the
+   get to the core as the raw path does. Commit 387a711e on
+   `polaris-tf-congruence` (local, not pushed).
 
 ## Results so far (job 7762244, raw only)
 
