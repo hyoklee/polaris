@@ -245,7 +245,13 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    soft limit with a 7-day grace period. Other large items are not this
    task's (`~/clio-core.dev` 14 GB, `~/.apptainer` 12 GB, `~/.npm` 3.9 GB,
    and a 1 GB `~/cte_client_test.dat` rewritten at 05:23 by another job).
-   All of this task's run output goes to /eagle.
+   All of this task's run output goes to /eagle. At the user's request
+   `~/cte_client_test.dat` was moved to `/eagle/radix-io/hyoklee/`; /home then
+   reported 44.35 GB with the over-quota flag and grace period cleared. That
+   file is written by clio-core's unit test
+   (`context-transfer-engine/test/unit/test_core_client_config.cc:82`,
+   `$HOME/cte_client_test.dat`), so the 3-hourly clio_core runner will
+   recreate it in /home on its next test run.
 
 ## Results so far (job 7762244, raw only)
 
