@@ -292,8 +292,21 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    | Trace line `[GENERIC] gwire=13` in the zstd run | 7763607 | 13 is `nvcomp-zstd` in the registry, but the switch sends 13 to Deflate |
 
    **Fix:** commit 9fb7c833 on `polaris-tf-congruence` swaps the two cases.
-   Verification: rebuild 7763627, then diag6 on the synthetic cells plus the
-   full run's A_O33737 zstd/deflate fit cells.
+   **Verified** (rebuild 7763627, step [3] OK; diag6 job 7763632; the step [4]
+   errors are in other paged benchmarks, which this change does not touch):
+
+   | Case | Before (7763607) | After (7763632) |
+   | --- | --- | --- |
+   | s_gdeflate_batch (control) | OK | OK, 1.40×, read 0.14 GB/s |
+   | s_zstd_batch | rc 1, status 11 on every chunk | **OK**, 1.41×, read 0.10 GB/s |
+   | s_deflate_batch | rc 139, waiter timeouts | **OK**, 1.41×, read 0.20 GB/s |
+   | s_zstd_rb0 (per-page faults) | rc 134 | **OK**, read 0.30 GB/s |
+   | s_deflate_rb0 (per-page faults) | — | **OK**, read 0.86 GB/s |
+   | A_O33737 fit, deflate (full run's cell) | rc 134 | **OK, 1.67×**, write 0.04 / read 0.27 GB/s |
+   | A_O33737 fit, zstd (full run's cell) | rc 1 | killed at 180 s: the issue 7 write-pass livelock ("ROUND CAP HIT", faults 3198 vs puts 3182). The 14 pages its batched decode did reach all decoded OK |
+
+   So the zstd/deflate decode is fixed. What is left for zstd on real data is
+   issue 7, which therefore is not lz4-specific.
 
 7. **lz4 on A_O18825 livelocks in the write pass** (fit, dram, host; the
    lustre cell passed). After 2,000,000 relaunch rounds the bench reports
@@ -301,7 +314,9 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    satisfied" (`GVSTAT-WRITE faults=8994 puts=8978`: one unsatisfied fault per
    block). The run then hits the 600 s limit (rc 124). It happens only with
    lz4 on the larger granule's arrays (2652 MB), so it is load dependent. Not
-   investigated.
+   investigated. Also hit by zstd on A_O33737 in job 7763632 (after the
+   issue 6 fix), so it is not lz4-specific; the slow codecs (write 0.01–0.03
+   GB/s) are the ones that trip it.
 
 ## Results: CLIO nvCOMP GPU tiering (job 7763065, 2026-10-20)
 
