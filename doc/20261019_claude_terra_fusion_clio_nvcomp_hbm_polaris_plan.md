@@ -255,7 +255,7 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    **Fix:** clio-core commit 843290d6 on branch
    `fix/test-core-client-tmpdir` (worktree
    `/eagle/radix-io/hyoklee/clio-core.fix-test-tmpdir`, from `origin/dev`
-   e7e409d0; local, not pushed) puts the test's files in
+   e7e409d0; PR https://github.com/iowarp/clio-core/pull/1303) puts the test's files in
    `std::filesystem::temp_directory_path()` (`TMPDIR`, else `/tmp`), with home
    only as a fallback. The runner's `ctest -D Continuous` resets
    `~/clio-core.dev` to `origin/dev` before each build, so the runner gets the
