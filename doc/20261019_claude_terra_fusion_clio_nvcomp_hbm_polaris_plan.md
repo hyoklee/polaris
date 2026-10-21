@@ -137,7 +137,7 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7764277 | debug | ASan, miniconda `ctest` | test aborted at start: XALT's `LD_PRELOAD` (`libxalt_init.so`) puts a library ahead of the ASan runtime |
 | 7764278 | capacity | A_O33737 zstd ×3, untraced, with always-on decode-failure logs | 2 of 3 OK (1.87×). In the third, one 8-page batch missed the 2 s waiter bound, then CUDA error 700 (issue 7c) |
 | 7764310 | debug | ASan, `LD_PRELOAD` unset | **`cr_ipc_internals_tests` 30/30 pass**; fix pushed to PR #1304 (eafc0ecc) |
-| 7764312 | capacity | A_O33737 zstd ×3 with drainer step timing | queued |
+| 7764312 | capacity | A_O33737 zstd ×3 with drainer step timing | **3/3 OK**, 1.87×, read 0.23 GB/s. Slowest `RunDecompBatch` 360 ms; no inner step (temp size, allocation, header wait) over 100 ms |
 
 ## Issues
 
@@ -366,8 +366,16 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    stops, and the abandoned decode kernel then makes an illegal memory access
    (CUDA error 700), probably into pages the stopping bench has already
    released. The traced run passed but showed drain batches of up to 752 ms.
-   Job 7764312 times each drainer step that can block (temp-size query,
-   arena and scratch allocation, header D2H wait).
+   Job 7764312 timed each drainer step that can block (temp-size query,
+   arena and scratch allocation, header D2H wait). All three runs passed.
+   The slowest batch took 360 ms, and no inner step took over 100 ms. So the
+   time goes to waiting for a free decode segment, i.e. GPU zstd decode
+   throughput, not to allocation; scratch is 6.5–52 MB per segment
+   (32–256 chunks of 64 KiB). Since the 7b fix, A_O33737 zstd has passed 6 of
+   7 runs. Two candidate fixes, not yet made:
+   - raise the 2 s waiter bound, which exists only to catch a wedged drainer;
+   - more importantly, a waiter that gives up must not let the bench release
+     a page that an in-flight decode is still writing (the CUDA error 700).
 
 ## Results: CLIO nvCOMP GPU tiering (job 7763065, 2026-10-20)
 
