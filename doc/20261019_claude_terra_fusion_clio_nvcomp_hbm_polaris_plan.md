@@ -138,6 +138,7 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7764278 | capacity | A_O33737 zstd ×3, untraced, with always-on decode-failure logs | 2 of 3 OK (1.87×). In the third, one 8-page batch missed the 2 s waiter bound, then CUDA error 700 (issue 7c) |
 | 7764310 | debug | ASan, `LD_PRELOAD` unset | **`cr_ipc_internals_tests` 30/30 pass**; fix pushed to PR #1304 (eafc0ecc) |
 | 7764312 | capacity | A_O33737 zstd ×3 with drainer step timing | **3/3 OK**, 1.87×, read 0.23 GB/s. Slowest `RunDecompBatch` 360 ms; no inner step (temp size, allocation, header wait) over 100 ms |
+| 7765913 | capacity | A_O33737 zstd ×3 and A_O18825 lz4 with the waiter fix (6ab9d70b) | **4/4 OK**; zstd 1.87×, read 0.22–0.25 GB/s; slowest batch 441 ms |
 
 ## Issues
 
@@ -372,10 +373,16 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    time goes to waiting for a free decode segment, i.e. GPU zstd decode
    throughput, not to allocation; scratch is 6.5–52 MB per segment
    (32–256 chunks of 64 KiB). Since the 7b fix, A_O33737 zstd has passed 6 of
-   7 runs. Two candidate fixes, not yet made:
-   - raise the 2 s waiter bound, which exists only to catch a wedged drainer;
-   - more importantly, a waiter that gives up must not let the bench release
-     a page that an in-flight decode is still writing (the CUDA error 700).
+   7 runs.
+
+   **Fix** (PR #1304, 6ab9d70b): on timeout, `WithdrawDecomp` takes the
+   request back out of the drain queue if the drainer hasn't gathered it yet,
+   and only then is the read failed. A request the drainer already owns is
+   waited out, bounded at ~60 s for a wedged GPU only. So the 2 s bound now
+   covers queueing alone, and neither the page nor the device scratch is
+   released under a live decode. Job 7765913: A_O33737 zstd 3/3 OK (1.87×),
+   A_O18825 lz4 control OK. No batch in those runs exceeded 2 s, so the
+   withdraw-or-wait path itself has not run yet.
 
 ## Results: CLIO nvCOMP GPU tiering (job 7763065, 2026-10-20)
 
