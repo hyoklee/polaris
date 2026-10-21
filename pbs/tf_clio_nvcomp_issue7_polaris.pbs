@@ -1,0 +1,62 @@
+#!/bin/bash
+#PBS -N tf_clio_issue7
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q capacity
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/tf_clio_nvcomp_issue7_polaris.log
+#
+# Issue 7 of doc/20261019_claude_terra_fusion_clio_nvcomp_hbm_polaris_plan.md:
+# is the write-pass "ROUND CAP HIT" a livelock, or a slow pass running out of
+# its 2,000,000-relaunch budget? Rebuilds the stream bench (round cap now
+# CLIO_GV_MAX_ROUNDS, prints GVROUNDS) and reruns the cells that hit it with
+# no round cap and a 20 min wall cap, plus a passing control at the default.
+set -o pipefail
+W=/eagle/radix-io/hyoklee/tf
+BUILD=${W}/build_tf_nvcomp
+BIN=${BUILD}/bin
+JOBID=${PBS_JOBID%%.*}
+RUN=${W}/tf_clio_nvcomp/issue7_${JOBID:-manual}
+CUDA_ROOT=/soft/compilers/cudatoolkit/cuda-12.9.1
+NVCOMP_ROOT=${W}/venv-tf/lib/python3.12/site-packages/nvidia/libnvcomp
+export LD_LIBRARY_PATH=${BIN}:${CUDA_ROOT}/lib64:${NVCOMP_ROOT}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+mkdir -p "$RUN"
+exec > >(tee -a "$RUN/job.log") 2>&1
+echo "[$(date +%T)] host=$(hostname) clio-core: $(git -C /home/hyoklee/clio-core.dev.tf log --oneline -1)"
+git -C /home/hyoklee/clio-core.dev.tf status --short | sed 's/^/    /'
+/home/hyoklee/miniconda3/bin/cmake --build "$BUILD" -j "$(nproc)" --target clio_gpu_vector_stream_bench clio_cte_compressor_runtime > "$RUN/build.log" 2>&1 \
+    || { echo "bench build failed"; tail -20 "$RUN/build.log"; exit 1; }
+echo "[$(date +%T)] bench and compressor rebuilt"
+D=${W}/tf_clio_nvcomp/data
+case_() {   # case_ <label> <timeout s> <env...> -- <bench args...>
+    local label=$1 to=$2; shift 2
+    local envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
+    local d="${RUN}/${label}"; mkdir -p "$d"
+    echo "${envs[*]} clio_gpu_vector_stream_bench $*" > "$d/cmd"
+    local t0=$SECONDS
+    (cd "$d" && env CUDA_VISIBLE_DEVICES=0 "${envs[@]}" \
+        timeout -k 20 "$to" "${BIN}/clio_gpu_vector_stream_bench" "$@") > "$d/out.log" 2>&1
+    local rc=$?
+    echo "[$(date +%T)] ${label}: rc=$rc $((SECONDS - t0))s" \
+         "$(grep -m1 '^GVS ' "$d/out.log" | grep -oE '(ratio|write_GBps|read_GBps|checksum)=[^ ]+' | tr '\n' ' ')" \
+         "| $(grep -m1 GVSTAT-WRITE "$d/out.log") | $(grep GVROUNDS "$d/out.log" | tr '\n' ' ')" \
+         "| $(grep -oE '(ROUND|WALL) CAP HIT' "$d/out.log" | head -1)"
+    for _ in $(seq 1 20); do
+        [ "$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')" -lt 1000 ] && break
+        sleep 1
+    done
+}
+A33=(--data-file ${D}/A_O33737.bin --total-mb 1962 --tier-type hbm --vram-mb 2708 --spill-type ram --spill-mb 3924 --blocks 16 --page-kb 256 --read-batch 8)
+A18=(--data-file ${D}/A_O18825.bin --total-mb 2654 --tier-type hbm --vram-mb 3573 --spill-type ram --spill-mb 5308 --blocks 16 --page-kb 256 --read-batch 8)
+UNCAPPED=(CLIO_GV_MAX_ROUNDS=0 CLIO_GV_WALL_CAP_MS=1200000)
+# CELLS picks a subset (default all), e.g. CELLS="a33_zstd a18_zstd".
+want() { [ -z "${CELLS:-}" ] || [[ " $CELLS " == *" $1 "* ]]; }
+want ctl_a33_lz4 && case_ ctl_a33_lz4  300  -- "${A33[@]}" --codec lz4
+want a18_lz4     && case_ a18_lz4      1320 "${UNCAPPED[@]}" -- "${A18[@]}" --codec lz4
+want a33_zstd    && case_ a33_zstd     1320 "${UNCAPPED[@]}" -- "${A33[@]}" --codec zstd
+want a18_zstd    && case_ a18_zstd     1320 "${UNCAPPED[@]}" -- "${A18[@]}" --codec zstd
+for i in 1 2 3; do want a33_zstd_r$i && case_ a33_zstd_r$i 1320 "${UNCAPPED[@]}" -- "${A33[@]}" --codec zstd; done
+echo "[$(date +%T)] done: $RUN"

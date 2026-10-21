@@ -1,0 +1,51 @@
+#!/bin/bash
+#PBS -N clio_asan_ipc
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/clio_asan_ipc_internals_polaris.log
+#
+# clio-core PR #1304's ASan CI failure: heap-use-after-free in
+# IpcManager::GetNodeIds (admin idle probe) racing LoadHostfile's clear()
+# from cr_ipc_internals_tests. Builds SRC CPU-only, Debug + ASan, with the
+# same deps as build_tf_nvcomp_polaris.pbs, and repeats the test.
+set -o pipefail
+SRC=${SRC:-/eagle/radix-io/hyoklee/clio-core.fix-nvcomp6}
+BUILD=${BUILD:-/eagle/radix-io/hyoklee/tf/build_asan_ipc}
+REPEAT=${REPEAT:-30}
+CMAKE=/home/hyoklee/miniconda3/bin/cmake
+JOBS=$(nproc)
+echo "[$(date +%T)] host=$(hostname) source: $(git -C "$SRC" log --oneline -1)"
+git -C "$SRC" status --short | sed 's/^/    /'
+$CMAKE -S "$SRC" -B "$BUILD" \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc-14 -DCMAKE_CXX_COMPILER=/usr/bin/g++-14 \
+    -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+    -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address" \
+    -DPoco_DIR=/home/hyoklee/miniconda3/lib/cmake/Poco \
+    -Dcereal_DIR=/home/hyoklee/miniconda3/lib/cmake/cereal \
+    -Dmsgpack-c_DIR=/home/hyoklee/miniconda3/lib/cmake/msgpack-c \
+    -Dnlohmann_json_ROOT=/home/hyoklee/deps/nlohmann_json \
+    -DCLIO_CORE_ENABLE_RUNTIME=ON -DCLIO_CORE_ENABLE_CTE=ON \
+    -DCLIO_CORE_ENABLE_CAE=OFF -DCLIO_CORE_ENABLE_CEE=OFF \
+    -DCLIO_CORE_ENABLE_CUDA=OFF -DCLIO_CORE_ENABLE_TESTS=ON \
+    -DCLIO_CORE_ENABLE_BENCHMARKS=OFF > "${BUILD}.configure.log" 2>&1 \
+    || { echo "configure failed"; tail -30 "${BUILD}.configure.log"; exit 1; }
+echo "[$(date +%T)] configured"
+$CMAKE --build "$BUILD" -j "$JOBS" --target clio_run_ipc_internals_tests > "${BUILD}.build.log" 2>&1 \
+    || { echo "build failed"; grep -E 'error' "${BUILD}.build.log" | head -20; exit 1; }
+# Admin/bdev chimods are dlopen'ed by the runtime the test starts.
+$CMAKE --build "$BUILD" -j "$JOBS" -- -k > "${BUILD}.all.log" 2>&1 || echo "  (some other targets failed; see ${BUILD}.all.log)"
+echo "[$(date +%T)] built"
+echo "LD_PRELOAD was: ${LD_PRELOAD:-<unset>}"; unset LD_PRELOAD
+export ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:abort_on_error=0:verify_asan_link_order=0
+export LSAN_OPTIONS=suppressions=${SRC}/CI/lsan_suppressions.txt:print_suppressions=0
+cd "$BUILD" && /home/hyoklee/miniconda3/bin/ctest -R '^cr_ipc_internals_tests$' --repeat until-fail:${REPEAT} --output-on-failure 2>&1 | tail -60
+echo "ctest rc=${PIPESTATUS[0]}"
+grep -lE 'AddressSanitizer' "$BUILD"/Testing/Temporary/*.log 2>/dev/null | head
+echo "[$(date +%T)] done"

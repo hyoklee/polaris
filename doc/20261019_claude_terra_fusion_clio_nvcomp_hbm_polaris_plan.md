@@ -127,6 +127,17 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7763058 | debug | rebuild with the nvCOMP 6 parser fix (c41bb9a9) | exit 1 after 41 s, right after step [3], which had already relinked the compressor runtime (with the fix) and the stream bench. Likely cause: /home over its 45 GB quota (50.8 GB; issue 5), and the job writes its log there |
 | 7763059 | capacity | smoke + full matrix (afterok 7763058) | deleted by PBS with the failed build |
 | 7763065 | capacity | smoke + full matrix, submitted directly on 7763058's step [3] binaries (no other source changed) | ran 05:34–07:11 UTC, 1 h 37 min. **First nvCOMP results**: lz4, gdeflate and ans pass the checksum in every tier; zstd and deflate fail every read (issue 6); lz4 on A_O18825 livelocks in 3 of 4 tiers (issue 7) |
+| 7763632 | debug | `pbs/tf_clio_nvcomp_diag6_polaris.pbs` `REAL=1` on the zstd/deflate fix | issue 6 fixed; zstd on A_O33737 stops at the round cap (issue 7) |
+| 7764046 | debug | `pbs/clio_asan_ipc_internals_polaris.pbs`: ASan build of PR #1304 + `hostfile_mu_` fix, `cr_ipc_internals_tests` ×30 | configure failed: the runtime CLI tests depend on a CTE target and the script had CTE off |
+| 7764060 | capacity | `pbs/tf_clio_nvcomp_issue7_polaris.pbs`: A_O18825 lz4 and A_O33737 zstd with no round cap, plus a capped control | lz4 OK uncapped (issue 7a); zstd crashes in the read pass (issue 7b) |
+| 7764226 | debug | ASan rerun with CTE on | build failed: `cr_ipc_internals_tests` is the test name, the target is `clio_run_ipc_internals_tests` |
+| 7764230 | capacity | issue 7 job, `CELLS="a33_zstd a18_zstd"`, with the zstd temp-size fix | scratch overflow gone. A_O18825 zstd **OK, 1.85×**. A_O33737 zstd fails its read pass (issue 7c) |
+| 7764258 | debug | ASan, target fixed | `ctest` not on the compute node's PATH |
+| 7764259 | capacity | A_O33737 zstd with `CLIO_CODEC_TRACE=1` | **OK, 1.87×**. Drain batches up to 752 ms |
+| 7764277 | debug | ASan, miniconda `ctest` | test aborted at start: XALT's `LD_PRELOAD` (`libxalt_init.so`) puts a library ahead of the ASan runtime |
+| 7764278 | capacity | A_O33737 zstd ×3, untraced, with always-on decode-failure logs | 2 of 3 OK (1.87×). In the third, one 8-page batch missed the 2 s waiter bound, then CUDA error 700 (issue 7c) |
+| 7764310 | debug | ASan, `LD_PRELOAD` unset | **`cr_ipc_internals_tests` 30/30 pass**; fix pushed to PR #1304 (eafc0ecc) |
+| 7764312 | capacity | A_O33737 zstd ×3 with drainer step timing | queued |
 
 ## Issues
 
@@ -308,15 +319,55 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    So the zstd/deflate decode is fixed. What is left for zstd on real data is
    issue 7, which therefore is not lz4-specific.
 
-7. **lz4 on A_O18825 livelocks in the write pass** (fit, dram, host; the
-   lustre cell passed). After 2,000,000 relaunch rounds the bench reports
+7. **"ROUND CAP HIT" in the write pass: not a livelock, but two problems.**
+   In job 7763065, lz4 on A_O18825 stopped in 3 of 4 tiers (fit, dram, host;
+   the lustre cell passed). After 2,000,000 relaunch rounds the bench reports
    "ROUND CAP HIT ... 16 block(s) still suspended -- faults are not being
-   satisfied" (`GVSTAT-WRITE faults=8994 puts=8978`: one unsatisfied fault per
-   block). The run then hits the 600 s limit (rc 124). It happens only with
-   lz4 on the larger granule's arrays (2652 MB), so it is load dependent. Not
-   investigated. Also hit by zstd on A_O33737 in job 7763632 (after the
-   issue 6 fix), so it is not lz4-specific; the slow codecs (write 0.01–0.03
-   GB/s) are the ones that trip it.
+   satisfied" (`GVSTAT-WRITE faults=8994 puts=8978`), then hits the 600 s limit
+   (rc 124). zstd on A_O33737 did the same in job 7763632.
+
+   **7a. The relaunch cap is too low for slow codecs.** The stream bench's
+   `RunToCompletion` cap counts *all* kernel relaunches, not relaunches without
+   progress. `faults - puts = 16` is one in-flight page per block, which is the
+   normal steady state, and every submitted put had been compressed (3182
+   `gpu_comp` lines for 3182 puts). No worker stall was logged. The slow
+   writers (0.01–0.03 GB/s) simply used up the budget 85% / 41% of the way
+   through. The bench now reads the cap from `CLIO_GV_MAX_ROUNDS` (default
+   unchanged, 0 = no cap) and prints `GVROUNDS rounds=… cap=…`. Job 7764060:
+
+   | Cell | Cap | Rounds (write / read) | Result |
+   | --- | --- | --- | --- |
+   | A_O33737 lz4 (control) | 2,000,000 | 1,701,645 / 982 | OK, 1.36×, 84 s |
+   | A_O18825 lz4 | none | **2,451,159** / 454 | **OK, 1.30×**, 113 s, write 0.03 / read 0.27 GB/s |
+   | A_O33737 zstd | none | **4,886,142** / — | write pass completes (faults = puts = 7840), then crashes in the read pass: 7b |
+
+   So the lz4 "livelock" was the cap: A_O18825 needs 2.45 M rounds and
+   completes with the right checksum once the cap is lifted.
+
+   **7b. clio-core bug: zstd decode under-sizes nvCOMP's scratch buffer.**
+   The uncapped zstd run's read pass printed "nvcomp ZSTD scratch buffer
+   allocation exceeded. please contact NVIDIA." many times, then CUDA error
+   719 (unspecified launch failure), then a heap corruption and segfault
+   (rc 139). The batched decode path (`LaunchDecompBatch` and the drain-loop
+   segment path) sizes scratch with `nvcompBatched*DecompressGetTempSizeSync`.
+   That call parses the actual compressed chunks, and for zstd its answer
+   depends on the data. CLIO caches the result keyed only on the batch shape
+   (chunk count, max chunk size) and asks again only when the shape grows, so
+   a later zstd batch of the same shape can need more scratch than was
+   reserved. **Fix:** use the shape-only `nvcompBatched*DecompressGetTempSize
+   (nch, max_unc, opts, &bytes, nch * max_unc)`, which is a bound for exactly
+   that cache key. Verification: job 7764230 (A_O33737 and A_O18825 zstd,
+   uncapped). **Verified** (7764230): A_O18825 zstd OK at 1.85×; the scratch
+   message is gone. Pushed to PR #1304 as 58de2101.
+
+   **7c. Open: intermittent read-pass timeout, zstd on A_O33737.** About one
+   run in three (job 7764278). One 8-page read batch is not done within the
+   waiter's 2 s bound (`kDecompWaitMaxSpins`). Those reads fail, the bench
+   stops, and the abandoned decode kernel then makes an illegal memory access
+   (CUDA error 700), probably into pages the stopping bench has already
+   released. The traced run passed but showed drain batches of up to 752 ms.
+   Job 7764312 times each drainer step that can block (temp-size query,
+   arena and scratch allocation, header D2H wait).
 
 ## Results: CLIO nvCOMP GPU tiering (job 7763065, 2026-10-20)
 
