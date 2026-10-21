@@ -139,6 +139,7 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
 | 7764310 | debug | ASan, `LD_PRELOAD` unset | **`cr_ipc_internals_tests` 30/30 pass**; fix pushed to PR #1304 (eafc0ecc) |
 | 7764312 | capacity | A_O33737 zstd ×3 with drainer step timing | **3/3 OK**, 1.87×, read 0.23 GB/s. Slowest `RunDecompBatch` 360 ms; no inner step (temp size, allocation, header wait) over 100 ms |
 | 7765913 | capacity | A_O33737 zstd ×3 and A_O18825 lz4 with the waiter fix (6ab9d70b) | **4/4 OK**; zstd 1.87×, read 0.22–0.25 GB/s; slowest batch 441 ms |
+| 7766074 | capacity | full rerun with all fixes, no relaunch cap, rebuilt from 8069aa6a | **76/76 checksum OK** in 1 h 37 min; see the 2026-10-21 results |
 
 ## Issues
 
@@ -383,6 +384,46 @@ Storage: inputs ~8.9 GB in `/eagle/radix-io/hyoklee/tf/tf_clio_nvcomp/data`
    released under a live decode. Job 7765913: A_O33737 zstd 3/3 OK (1.87×),
    A_O18825 lz4 control OK. No batch in those runs exceeded 2 s, so the
    withdraw-or-wait path itself has not run yet.
+
+## Results: full rerun with all fixes (job 7766074, 2026-10-21)
+
+clio-core `polaris-tf-congruence` 8069aa6a: the PR #1304 compressor fixes
+(issues 3, 4, 6, 7b, 7c) and the stream bench with no relaunch cap (issue 7a,
+`CLIO_GV_MAX_ROUNDS=0`, wall cap 840 s). One A100 node, 1 h 37 min.
+
+**All 76 runs passed the checksum.** That is every codec in every tier, on
+both granules. No run logged a decode timeout, a batch event error or a failed
+chunk. GPU 0 peaked at 19,039 MiB.
+
+Decoded arrays (what a GPU consumer reads). GB/s are of the logical bytes;
+the read range is across the fit, dram and host tiers, with lustre separate:
+
+| Codec | Ratio A_O33737 / A_O18825 | Write GB/s | Read GB/s (fit, dram, host) | Read GB/s (lustre) |
+| --- | --- | --- | --- | --- |
+| raw | 1.00 | 0.17–0.38 | 0.26–0.29 | 0.23–0.24 |
+| zstd | **1.87 / 1.85** | 0.01 | 0.18–0.25 | 0.12–0.14 |
+| deflate | 1.67 / 1.58 | 0.04–0.05 | 0.24–0.28 | 0.15 |
+| gdeflate | 1.65 / 1.57 | 0.04–0.05 | 0.23–0.32 | 0.14–0.18 |
+| lz4 | 1.36 / 1.30 | 0.03 | 0.24–0.29 | 0.15–0.16 |
+| ans | 1.22 / 1.19 | 0.18–0.23 | 0.25–0.30 | 0.13–0.14 |
+
+The granules' own HDF5 bytes (`H_`, already deflated) gain almost nothing:
+1.00–1.03× for every codec, in both tiers.
+
+Per-page faults (`--read-batch 0`, A_O33737 fit): raw reads at **2.47
+GB/s**, zstd at 0.02 GB/s.
+
+What this shows:
+- **Reads are bound by the fault round trip, not by the codec.** With
+  batched faults, every codec reads at about the speed of raw, 0.2–0.3
+  GB/s. Per-page raw faults read 10× faster.
+- **The codecs differ in write speed and ratio.** zstd stores 46–47% less
+  than raw but writes at only 0.01 GB/s: 3–4 minutes for 2–2.6 GB. ans
+  writes nearly as fast as raw (0.2 GB/s) but saves only 16–18%. deflate
+  and gdeflate sit between them: 1.6× at 0.04–0.05 GB/s.
+- **Spilling to Lustre roughly halves read speed** for every codec.
+- zstd per-page decode (0.02 GB/s) is far slower than batched: zstd needs
+  batching.
 
 ## Results: CLIO nvCOMP GPU tiering (job 7763065, 2026-10-20)
 
