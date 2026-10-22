@@ -90,8 +90,8 @@ small. Long multi-file changes are untested.
 
 5. **The server takes about a minute to answer.** `ollama serve` took 61 s
    before `/api/version` answered: GPU discovery across the four A100s plus
-   starting from /eagle. The job waits up to 60 polls and only just made it.
-   Allow at least 2 minutes in scripts.
+   starting from /eagle. The job waited up to 60 s and only just made it; it now
+   waits up to 180 s.
 
 6. **The first load takes 200 s: Lustre read speed.** Loading 23 GB from
    `/eagle` took 200 s, about 115 MB/s. After that, `OLLAMA_KEEP_ALIVE=-1`

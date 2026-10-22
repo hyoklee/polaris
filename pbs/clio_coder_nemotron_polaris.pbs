@@ -47,7 +47,7 @@ SMI=$!
 "$OLLAMA_ROOT/bin/ollama" serve > "$RUN/ollama_serve.log" 2>&1 &
 SRV=$!
 trap 'kill $SRV $SMI 2>/dev/null' EXIT
-for _ in $(seq 1 60); do
+for _ in $(seq 1 180); do   # startup took 61 s (doc issue 5)
     curl -sf "http://$OLLAMA_HOST/api/version" >/dev/null && break
     sleep 1
 done
