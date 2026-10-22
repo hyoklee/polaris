@@ -1,0 +1,179 @@
+#!/bin/bash
+#PBS -N clio_coder_nemo
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/clio_coder_nemotron_polaris.log
+#
+# Nemotron 3 Nano (30B-A3B, Q4_K_M) served by Ollama on the node's A100s,
+# driven by Clio Coder (target polaris-nemotron, runtime ollama). Notes:
+# doc/20261022_claude_clio_coder_nemotron_polaris.md.
+#
+#   [1] ollama serve (official v0.40.8 build with CUDA runners; the conda-forge
+#       ollama in miniconda is a CPU-only build), check it sees the GPUs
+#   [2] load time and tokens/s through /api/generate
+#   [3] clio-coder run, answer mode: explain a file of this repo (read-only)
+#   [4] clio-coder run, change mode: fix a bug in a throwaway project; the
+#       job then runs the project's test itself
+#
+# Overrides: MODEL, CTX (context window, 131072), TIMEOUT (per clio-coder run, s)
+set -o pipefail
+OLLAMA_ROOT=/eagle/radix-io/hyoklee/ollama/v0.40.8
+export OLLAMA_MODELS=/eagle/radix-io/hyoklee/models/ollama
+export OLLAMA_HOST=127.0.0.1:11519
+export OLLAMA_CONTEXT_LENGTH=${CTX:-131072}
+export OLLAMA_KEEP_ALIVE=-1
+export OLLAMA_FLASH_ATTENTION=1
+export https_proxy=http://proxy.alcf.anl.gov:3128 HTTPS_PROXY=http://proxy.alcf.anl.gov:3128
+export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+MODEL=${MODEL:-nemotron-3-nano:latest}
+TIMEOUT=${TIMEOUT:-900}
+JOBID=${PBS_JOBID%%.*}
+RUN=/eagle/radix-io/hyoklee/clio_coder_test/run_${JOBID:-manual}
+mkdir -p "$RUN"
+exec > >(tee -a "$RUN/job.log") 2>&1
+T0=$SECONDS
+ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
+ts "host=$(hostname) run=$RUN model=$MODEL ctx=$OLLAMA_CONTEXT_LENGTH"
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader | sed 's/^/    /'
+nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu \
+    --format=csv,noheader,nounits -l 1 > "$RUN/gpu.log" 2>&1 &
+SMI=$!
+
+# --- [1] server ------------------------------------------------------------------
+"$OLLAMA_ROOT/bin/ollama" serve > "$RUN/ollama_serve.log" 2>&1 &
+SRV=$!
+trap 'kill $SRV $SMI 2>/dev/null' EXIT
+for _ in $(seq 1 60); do
+    curl -sf "http://$OLLAMA_HOST/api/version" >/dev/null && break
+    sleep 1
+done
+ts "[1] ollama $(curl -sf "http://$OLLAMA_HOST/api/version")"
+grep -E 'inference compute' "$RUN/ollama_serve.log" | sed 's/^.*msg=/    /' | cut -c1-220
+grep -q 'library=CUDA' "$RUN/ollama_serve.log" || ts "WARNING: no CUDA device found by ollama"
+
+# --- [2] load + throughput -------------------------------------------------------
+gen() {   # gen <label> <prompt>
+    local t0=$SECONDS
+    curl -sf "http://$OLLAMA_HOST/api/generate" -d "$(python3 -c '
+import json,sys; print(json.dumps({"model":sys.argv[1],"prompt":sys.argv[2],"stream":False,"think":False}))' "$MODEL" "$2")" \
+        > "$RUN/gen_$1.json"
+    python3 -c '
+import json,sys
+r=json.load(open(sys.argv[1]))
+ns=1e9
+print("    %s: wall=%ss load=%.1fs prompt=%d tok @ %.0f tok/s, output=%d tok @ %.1f tok/s" % (
+    sys.argv[2], sys.argv[3], r.get("load_duration",0)/ns,
+    r.get("prompt_eval_count",0), r.get("prompt_eval_count",0)/max(r.get("prompt_eval_duration",1)/ns,1e-9),
+    r.get("eval_count",0), r.get("eval_count",0)/max(r.get("eval_duration",1)/ns,1e-9)))
+print("    answer: " + r.get("response","").strip().replace("\n"," ")[:300])' "$RUN/gen_$1.json" "$1" "$((SECONDS - t0))" \
+        || ts "gen $1 failed: $(head -c 300 "$RUN/gen_$1.json")"
+}
+ts "[2] generate"
+gen cold "In two sentences, what is HDF5?"
+gen warm "Write a C function that returns the number of set bits in a uint64_t. Code only."
+"$OLLAMA_ROOT/bin/ollama" ps | sed 's/^/    /'
+grep -E 'offload|model weights|layers.offload|kv cache' "$RUN/ollama_serve.log" | sed 's/^.*msg=/    /' | cut -c1-200 | head -8
+
+# --- [3] clio-coder, answer mode ----------------------------------------------------
+cc() {   # cc <label> <cwd> <extra flags...> -- <task>
+    local label=$1 cwd=$2; shift 2
+    local flags=()
+    while [ "$1" != -- ]; do flags+=("$1"); shift; done; shift
+    local t0=$SECONDS rc
+    ( cd "$cwd" && timeout -k 30 $((TIMEOUT + 60)) clio-coder run --target polaris-nemotron \
+        --model "$MODEL" --timeout "$TIMEOUT" --no-delegate --json "${flags[@]}" "$*" ) \
+        > "$RUN/cc_${label}.jsonl" 2> "$RUN/cc_${label}.err"
+    rc=$?
+    ts "clio-coder ${label}: rc=$rc $((SECONDS - t0))s"
+    python3 - "$RUN/cc_${label}.jsonl" <<'EOF'
+import json, sys, collections
+tools = collections.Counter(); final = ""; errs = []; n = 0
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line.startswith("{"): continue
+    try: e = json.loads(line)
+    except Exception: continue
+    n += 1
+    t = e.get("type", "")
+    if "tool" in t and ("start" in t or "call" in t):
+        tools[e.get("toolName") or e.get("name") or e.get("tool") or "?"] += 1
+    if "error" in t or e.get("error"):
+        errs.append(str(e.get("error") or e)[:200])
+    if t == "turn_end":
+        m = e.get("message") or {}
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list):
+            final = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+        elif isinstance(c, str):
+            final = c
+        final = final or e.get("text", "")
+print("    events=%d tools=%s" % (n, dict(tools)))
+for x in errs[:3]: print("    error: " + x)
+print("    final: " + final.strip().replace("\n", " ")[:600])
+EOF
+    [ -s "$RUN/cc_${label}.err" ] && sed 's/^/    stderr: /' "$RUN/cc_${label}.err" | tail -5 | cut -c1-250
+    return 0
+}
+ts "[3] clio-coder answer mode"
+cc explain /home/hyoklee/polaris --turn-mode answer -- \
+    "Read src/nvcomp_probe/nvcomp_temp_probe.cu and explain in at most 6 bullet points what the program tests and what its command-line arguments mean. Do not modify any file."
+
+# --- [4] clio-coder, change mode --------------------------------------------------------
+P="$RUN/stats_project"
+mkdir -p "$P"
+cat > "$P/stats.py" <<'EOF'
+"""Small statistics helpers."""
+
+
+def mean(xs):
+    return sum(xs) / len(xs)
+
+
+def median(xs):
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2]
+
+
+def sample_variance(xs):
+    m = mean(xs)
+    return sum((x - m) ** 2 for x in xs) / len(xs)
+EOF
+cat > "$P/test_stats.py" <<'EOF'
+import unittest
+from stats import mean, median, sample_variance
+
+
+class TestStats(unittest.TestCase):
+    def test_mean(self):
+        self.assertEqual(mean([1, 2, 3, 4]), 2.5)
+
+    def test_median_odd(self):
+        self.assertEqual(median([3, 1, 2]), 2)
+
+    def test_median_even(self):
+        self.assertEqual(median([4, 1, 3, 2]), 2.5)
+
+    def test_sample_variance(self):
+        self.assertAlmostEqual(sample_variance([2, 4, 4, 4, 5, 5, 7, 9]), 32 / 7)
+
+
+if __name__ == "__main__":
+    unittest.main()
+EOF
+( cd "$P" && git init -q && git add . && git -c user.name=test -c user.email=test@localhost commit -qm init )
+( cd "$P" && python3 test_stats.py > "$RUN/test_before.log" 2>&1 ); ts "before: $(tail -1 "$RUN/test_before.log")"
+ts "[4] clio-coder change mode"
+cc fix "$P" --turn-mode change --autonomy yolo -- \
+    "The tests in test_stats.py fail. Fix stats.py (not the tests) so that 'python3 test_stats.py' passes, run the tests to confirm, and summarize what you changed."
+( cd "$P" && python3 test_stats.py > "$RUN/test_after.log" 2>&1 ); rc=$?
+ts "after: rc=$rc $(tail -1 "$RUN/test_after.log")"
+( cd "$P" && git --no-pager diff --stat && git --no-pager diff ) | sed 's/^/    /' | head -40
+
+echo "=== GPU memory peak (MiB) per GPU"
+awk -F', ' '{if ($3 > m[$2]) m[$2] = $3; if ($4 > u[$2]) u[$2] = $4} END {for (g in m) print "    GPU " g ": " m[g] " MiB, util peak " u[g] "%"}' "$RUN/gpu.log" | sort
+ts "done"
