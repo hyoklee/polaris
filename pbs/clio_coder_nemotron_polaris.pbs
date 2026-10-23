@@ -19,7 +19,10 @@
 #   [4] clio-coder run, change mode: fix a bug in a throwaway project; the
 #       job then runs the project's test itself
 #
-# Overrides: MODEL, CTX (context window, 131072), TIMEOUT (per clio-coder run, s)
+# Overrides: MODEL, CTX (context window, 131072), TIMEOUT (per clio-coder run, s),
+#   STAGE (default 1) copies the model to the node's local SSD (/local/scratch)
+#   first and serves it from there: 22 s + 10 s load instead of a 200 s load
+#   from /eagle (doc issue 6). STAGE=0 serves straight from /eagle.
 set -o pipefail
 OLLAMA_ROOT=/eagle/radix-io/hyoklee/ollama/v0.40.8
 export OLLAMA_MODELS=/eagle/radix-io/hyoklee/models/ollama
@@ -37,16 +40,29 @@ mkdir -p "$RUN"
 exec > >(tee -a "$RUN/job.log") 2>&1
 T0=$SECONDS
 ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
-ts "host=$(hostname) run=$RUN model=$MODEL ctx=$OLLAMA_CONTEXT_LENGTH"
+ts "host=$(hostname) run=$RUN model=$MODEL ctx=$OLLAMA_CONTEXT_LENGTH stage=${STAGE:-1}"
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader | sed 's/^/    /'
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu \
     --format=csv,noheader,nounits -l 1 > "$RUN/gpu.log" 2>&1 &
 SMI=$!
 
+# --- [0] optional staging to local SSD -----------------------------------------------
+if [ "${STAGE:-1}" = 1 ]; then
+    LOCAL=/local/scratch/ollama_models_${JOBID:-manual}
+    df -h /local/scratch | sed 's/^/    /'
+    ts "[0] staging $OLLAMA_MODELS -> $LOCAL"
+    t0=$SECONDS
+    mkdir -p "$LOCAL" && cp -r "$OLLAMA_MODELS/." "$LOCAL/" || { ts "staging failed"; exit 1; }
+    dt=$((SECONDS - t0))
+    bytes=$(du -sb "$LOCAL" | cut -f1)
+    ts "staged $((bytes / 1000000)) MB in ${dt}s ($((bytes / 1000000 / (dt > 0 ? dt : 1))) MB/s)"
+    export OLLAMA_MODELS=$LOCAL
+fi
+
 # --- [1] server ------------------------------------------------------------------
 "$OLLAMA_ROOT/bin/ollama" serve > "$RUN/ollama_serve.log" 2>&1 &
 SRV=$!
-trap 'kill $SRV $SMI 2>/dev/null' EXIT
+trap 'kill $SRV $SMI 2>/dev/null; [ -n "$LOCAL" ] && rm -rf "$LOCAL"' EXIT
 for _ in $(seq 1 180); do   # startup took 61 s (doc issue 5)
     curl -sf "http://$OLLAMA_HOST/api/version" >/dev/null && break
     sleep 1

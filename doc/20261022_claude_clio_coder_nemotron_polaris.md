@@ -23,6 +23,7 @@ To use it interactively on a compute node (e.g. `qsub -I`):
 ```bash
 export OLLAMA_MODELS=/eagle/radix-io/hyoklee/models/ollama OLLAMA_HOST=127.0.0.1:11519
 export OLLAMA_CONTEXT_LENGTH=131072 OLLAMA_KEEP_ALIVE=-1 OLLAMA_FLASH_ATTENTION=1
+cp -r "$OLLAMA_MODELS" /local/scratch/ && export OLLAMA_MODELS=/local/scratch/ollama   # issue 6
 /eagle/radix-io/hyoklee/ollama/v0.40.8/bin/ollama serve > /tmp/ollama.log 2>&1 &
 clio-coder --target polaris-nemotron        # or: clio-coder run --target polaris-nemotron "<task>"
 ```
@@ -55,9 +56,13 @@ with 2 `read`, 2 `edit` and 2 `bash` calls. It fixed both bugs in `stats.py`
 correctly: it averages the two middle values, and uses n − 1. It ran the tests
 itself and left the tests alone. The job's own test run afterwards: **OK**.
 
-**Verdict:** Nemotron 3 Nano runs comfortably on one Polaris A100 and works
-as a Clio Coder backend for small read-and-edit tasks. These two tasks are
-small. Long multi-file changes are untested.
+**Second run (job 7777160, model staged to local SSD): both Clio Coder tasks
+failed** with the same prompts (issue 9).
+
+**Verdict:** Nemotron 3 Nano runs comfortably on one Polaris A100. As a Clio
+Coder backend it can do small read-and-edit tasks, but not reliably: it did
+both tasks right in one run and both wrong in the other. Long multi-file
+changes are untested.
 
 ## Issues
 
@@ -89,16 +94,29 @@ small. Long multi-file changes are untested.
    works where the server runs (the compute node, on 127.0.0.1).
 
 5. **The server takes about a minute to answer.** `ollama serve` took 61 s
-   before `/api/version` answered: GPU discovery across the four A100s plus
-   starting from /eagle. The job waited up to 60 s and only just made it; it now
+   before `/api/version` answered. It took 61 s again with the model on local
+   SSD (job 7777160), so the time goes to GPU discovery across the four A100s,
+   not to /eagle. The job waited up to 60 s and only just made it; it now
    waits up to 180 s.
 
-6. **The first load takes 200 s: Lustre read speed.** Loading 23 GB from
-   `/eagle` took 200 s, about 115 MB/s. After that, `OLLAMA_KEEP_ALIVE=-1`
-   keeps the model resident, so only the first request in a job pays it. To
-   cut this, stage the model to the node's local SSD at the start of the job
-   (copy `$OLLAMA_MODELS` to `/local/scratch` and point `OLLAMA_MODELS` there)
-   and measure whether that is faster.
+6. **The first load takes 200 s from /eagle. Fixed by staging to local SSD.**
+   Loading the 23 GB model straight from `/eagle` took 200 s, about 115 MB/s.
+   The model is one 24 GB file on a single Lustre stripe. Yet `cp` read the
+   same file at 1.1 GB/s. So the slow part was the way Ollama reads the file
+   on Lustre, not the file system's bandwidth. Job 7777160 (`STAGE=1`)
+   copied the model to `/local/scratch` (2.9 TB NVMe) first:
+
+   | | Copy | Server start | First load | Job start to first answer |
+   | --- | --- | --- | --- | --- |
+   | From /eagle (7776849) | — | 61 s | 200 s | 300 s |
+   | Staged to local SSD (7777160) | 22 s (1.1 GB/s) | 61 s | **9.9 s** | 94 s |
+
+   Warm speed was unchanged (202 tok/s output, 634 tok/s prompt), as
+   expected. Staging is now the job's default (`STAGE=1`), and the job deletes
+   the local copy on exit. For interactive use, do the same before `ollama
+   serve`:
+   `cp -r /eagle/radix-io/hyoklee/models/ollama /local/scratch/ && export
+   OLLAMA_MODELS=/local/scratch/ollama`.
 
 7. **One factual error in the code explanation.** Clio Coder said the
    `total|zero` argument decides whether decompression "allocate[s] the full
@@ -111,3 +129,26 @@ small. Long multi-file changes are untested.
 8. **Change mode returns a JSON summary.** The `turn_end` message in change
    mode is a JSON object (`{"summary": "Fixed two bugs …"}`); answer mode
    returns Markdown. Scripts that read the final text must handle both.
+
+9. **Clio Coder results are not reproducible: the second run failed both
+   tasks.** Job 7777160 used the same model, prompts and settings as job
+   7776849; only the model's location differed (local SSD), and that cannot
+   change the weights or the output. The model samples, so runs differ.
+   - *Explain* (9 s): it called **no tools** and never read the file. It
+     made up a different program, one that "measures how fast temporary
+     storage allocations … behave", with options `-b <size>`, `-t <num>` and
+     `-d <device>`. None of that is in the file; the real arguments are
+     `<codec> <total|zero> [smooth|zeros|mixed]`.
+   - *Fix* (10 s): it ran `ls`, read both files, ran the tests, and found both
+     bugs correctly in small `python3 -c` checks. It also tried a tool that
+     does not exist (`code_exec`: "Tool code_exec not found"). Then it
+     **stopped without editing**: it wrote a correct diagnosis but never
+     changed `stats.py`. Its last message was empty, and both tests still
+     failed. `clio-coder run` still exited 0, so the exit code does not tell
+     a script whether the task was done. Check the result itself, as this job
+     does by re-running the tests.
+
+   One success and one failure per task is too few runs to give a success
+   rate. Things to try: run each task several times to measure how often it
+   works; check whether a lower temperature or thinking mode helps; and in
+   prompts, ask the model to read the file before answering.
