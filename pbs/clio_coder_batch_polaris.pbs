@@ -1,0 +1,110 @@
+#!/bin/bash
+#PBS -N clio_coder_batch
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/clio_coder_batch_polaris.log
+#
+# Runs Clio Coder tasks against Nemotron 3 Nano served on this node (Ollama,
+# target polaris-nemotron). Clio Coder cannot reach the server from a login
+# node (ssh is refused both ways), so tasks go in a file:
+#
+#   qsub -v TASKS=/path/tasks.jsonl pbs/clio_coder_batch_polaris.pbs
+#
+# One JSON object per line:
+#   {"name": "explain_x", "cwd": "/home/hyoklee/polaris", "mode": "answer",
+#    "prompt": "Read src/x.cu and explain ..."}
+# mode is "answer" (read-only, default) or "change" (edits files with
+# --autonomy yolo; cwd must be a git repo, and the job saves `git diff`).
+# Optional per task: "timeout" (s, default 900), "repeat" (runs, default 1).
+#
+# Output: /eagle/radix-io/hyoklee/clio_coder_batch/run_<jobid>/: <name>[_<i>].md
+# (final answer), .jsonl (events), .diff (change mode), summary.tsv.
+# Notes: doc/20261022_claude_clio_coder_nemotron_polaris.md.
+set -o pipefail
+OLLAMA_ROOT=/eagle/radix-io/hyoklee/ollama/v0.40.8
+JOBID=${PBS_JOBID%%.*}
+LOCAL=/local/scratch/ollama_models_${JOBID:-manual}
+export OLLAMA_HOST=127.0.0.1:11519
+export OLLAMA_CONTEXT_LENGTH=${CTX:-131072}
+export OLLAMA_KEEP_ALIVE=-1
+export OLLAMA_FLASH_ATTENTION=1
+export https_proxy=http://proxy.alcf.anl.gov:3128 HTTPS_PROXY=http://proxy.alcf.anl.gov:3128
+export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+MODEL=${MODEL:-nemotron-3-nano:latest}
+RUN=/eagle/radix-io/hyoklee/clio_coder_batch/run_${JOBID:-manual}
+mkdir -p "$RUN"
+exec > >(tee -a "$RUN/job.log") 2>&1
+T0=$SECONDS
+ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
+[ -f "$TASKS" ] || { ts "TASKS file not found: '$TASKS'"; exit 1; }
+cp "$TASKS" "$RUN/tasks.jsonl"
+ts "host=$(hostname) run=$RUN tasks=$TASKS ($(grep -c . "$TASKS") lines)"
+
+mkdir -p "$LOCAL" && cp -r /eagle/radix-io/hyoklee/models/ollama/. "$LOCAL/" || { ts "staging failed"; exit 1; }
+export OLLAMA_MODELS=$LOCAL
+"$OLLAMA_ROOT/bin/ollama" serve > "$RUN/ollama_serve.log" 2>&1 &
+SRV=$!
+trap 'kill $SRV 2>/dev/null; rm -rf "$LOCAL"' EXIT
+for _ in $(seq 1 180); do
+    curl -sf "http://$OLLAMA_HOST/api/version" >/dev/null && break
+    sleep 1
+done
+curl -sf "http://$OLLAMA_HOST/api/generate" -d "{\"model\":\"$MODEL\",\"prompt\":\"\",\"keep_alive\":-1}" >/dev/null \
+    || { ts "server or model load failed; see $RUN/ollama_serve.log"; exit 1; }
+ts "server up, model loaded"
+
+printf 'name\tmode\trc\tseconds\ttools\tchanged_files\n' > "$RUN/summary.tsv"
+n=0
+while IFS= read -r line; do
+    [ -z "${line// }" ] && continue
+    n=$((n + 1))
+    eval "$(python3 -c '
+import json, shlex, sys
+t = json.loads(sys.argv[1])
+for k, d in (("name", "task%s" % sys.argv[2]), ("cwd", "/home/hyoklee/polaris"), ("mode", "answer"),
+             ("prompt", ""), ("timeout", 900), ("repeat", 1)):
+    print("T_%s=%s" % (k, shlex.quote(str(t.get(k, d)))))' "$line" "$n")" || { ts "bad task line $n"; continue; }
+    flags=(--turn-mode "$T_mode")
+    if [ "$T_mode" = change ]; then
+        git -C "$T_cwd" rev-parse --git-dir >/dev/null 2>&1 || { ts "$T_name: change mode needs a git repo: $T_cwd"; continue; }
+        flags+=(--autonomy yolo)
+    fi
+    for i in $(seq 1 "$T_repeat"); do
+        out=$RUN/$T_name; [ "$T_repeat" -gt 1 ] && out=${out}_$i
+        [ "$T_mode" = change ] && base=$(git -C "$T_cwd" stash create 2>/dev/null || git -C "$T_cwd" rev-parse HEAD)
+        t0=$SECONDS
+        ( cd "$T_cwd" && timeout -k 30 $((T_timeout + 60)) clio-coder run --target polaris-nemotron \
+            --model "$MODEL" --timeout "$T_timeout" --no-delegate --json "${flags[@]}" "$T_prompt" ) \
+            > "$out.jsonl" 2> "$out.err"
+        rc=$?; dt=$((SECONDS - t0)); changed=-
+        if [ "$T_mode" = change ]; then
+            git -C "$T_cwd" --no-pager diff "$base" > "$out.diff"
+            changed=$(git -C "$T_cwd" --no-pager diff --name-only "$base" | wc -l)
+        fi
+        tools=$(python3 - "$out.jsonl" "$out.md" <<'EOF'
+import json, sys, collections
+tools = collections.Counter(); final = ""
+for line in open(sys.argv[1]):
+    try: e = json.loads(line)
+    except Exception: continue
+    if e.get("type") == "tool_execution_start":
+        tools[e.get("toolName", "?")] += 1
+    if e.get("type") == "turn_end":   # keep the last non-empty assistant text
+        c = (e.get("message") or {}).get("content")
+        text = " ".join(x.get("text", "") for x in c if isinstance(x, dict)) if isinstance(c, list) else (c or "")
+        if text.strip(): final = text
+open(sys.argv[2], "w").write(final.strip() + "\n")
+print(",".join("%s:%d" % kv for kv in sorted(tools.items())) or "none")
+EOF
+)
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(basename "$out")" "$T_mode" "$rc" "$dt" "$tools" "$changed" >> "$RUN/summary.tsv"
+        ts "$(basename "$out"): rc=$rc ${dt}s tools=$tools changed=$changed"
+        [ -s "$out.err" ] && tail -3 "$out.err" | sed 's/^/    stderr: /' | cut -c1-250
+    done
+done < "$TASKS"
+ts "done: $RUN"
+column -t -s $'\t' "$RUN/summary.tsv"

@@ -152,3 +152,26 @@ changes are untested.
    rate. Things to try: run each task several times to measure how often it
    works; check whether a lower temperature or thinking mode helps; and in
    prompts, ask the model to read the file before answering.
+
+10. **No way to reach the server from a login node; use batch tasks.** SSH
+    is refused from the login node to compute nodes ("Permission denied
+    (publickey,keyboard-interactive,hostbased)"; this account has no key)
+    and from compute nodes to login nodes ("Permission denied
+    (keyboard-interactive,hostbased)", job 7798240, which tried a reverse
+    tunnel). So Clio Coder must run on the node that serves the model:
+    either `qsub -I` from your own terminal, or `pbs/clio_coder_batch_polaris.pbs`
+    with a JSON-lines tasks file (`qsub -v TASKS=<file>`). The batch job
+    writes each answer, event log, diff (change mode) and a `summary.tsv` to
+    `/eagle/radix-io/hyoklee/clio_coder_batch/run_<jobid>`.
+    `pbs/nemotron_server_polaris.pbs` holds a node with the server up for
+    interactive use on that node; its tunnel option is off by default.
+
+11. **Smoke test of the batch runner (job 7798274, 1 min 52 s): an incomplete
+    answer reported as done.** Task: list `pbs/` with a tool and give one
+    line per script. Clio Coder listed the directory (30 files) and read 3
+    real scripts plus one that does not exist (`build_clio_core_polaris.pbs`,
+    a guessed name). It then answered with only those 3 lines, without
+    saying the list was incomplete, in 14 s with rc 0. The three lines were
+    roughly right (one added "FUSE", which the script does not mention). Like
+    issue 9, it stops early. Keep tasks small and specific, and check
+    answers against the files.

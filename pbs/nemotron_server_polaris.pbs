@@ -1,0 +1,68 @@
+#!/bin/bash
+#PBS -N nemotron_srv
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /home/hyoklee/polaris/logs/nemotron_server_polaris.log
+#
+# Holds a GPU node with Nemotron 3 Nano served by Ollama on 127.0.0.1:11519
+# until the walltime ends (or qdel), for interactive Clio Coder use
+# (target polaris-nemotron). Stages the model to local SSD first (doc issue 6)
+# and preloads it. The node name goes to /eagle/radix-io/hyoklee/nemotron_server/node.
+# Clio Coder has to run on this node: ssh is refused both login -> compute and
+# compute -> login (job 7798240), so no tunnel to a login node works.
+# Notes: doc/20261022_claude_clio_coder_nemotron_polaris.md.
+OLLAMA_ROOT=/eagle/radix-io/hyoklee/ollama/v0.40.8
+JOBID=${PBS_JOBID%%.*}
+LOCAL=/local/scratch/ollama_models_${JOBID}
+STATE=/eagle/radix-io/hyoklee/nemotron_server
+export OLLAMA_HOST=127.0.0.1:11519
+export OLLAMA_CONTEXT_LENGTH=${CTX:-131072}
+export OLLAMA_KEEP_ALIVE=-1
+export OLLAMA_FLASH_ATTENTION=1
+export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+MODEL=${MODEL:-nemotron-3-nano:latest}
+mkdir -p "$STATE"
+T0=$SECONDS
+ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
+ts "host=$(hostname) job=$JOBID"
+
+mkdir -p "$LOCAL" && cp -r /eagle/radix-io/hyoklee/models/ollama/. "$LOCAL/" || { ts "staging failed"; exit 1; }
+export OLLAMA_MODELS=$LOCAL
+ts "staged model to $LOCAL"
+
+"$OLLAMA_ROOT/bin/ollama" serve > "$STATE/ollama_serve_${JOBID}.log" 2>&1 &
+SRV=$!
+trap 'kill $SRV 2>/dev/null; rm -rf "$LOCAL"; rm -f "$STATE/node"' EXIT
+for _ in $(seq 1 180); do
+    curl -sf "http://$OLLAMA_HOST/api/version" >/dev/null && break
+    sleep 1
+done
+ts "ollama $(curl -sf "http://$OLLAMA_HOST/api/version")"
+curl -sf "http://$OLLAMA_HOST/api/generate" -d "{\"model\":\"$MODEL\",\"prompt\":\"\",\"keep_alive\":-1}" >/dev/null
+"$OLLAMA_ROOT/bin/ollama" ps
+echo "$(hostname) $JOBID" > "$STATE/node"
+ts "READY on $(hostname)"
+
+# TUNNEL=<host> forwards <host>'s 127.0.0.1:11519 to this server (ssh -R).
+# Off by default: compute -> login ssh is refused ("Permission denied
+# (keyboard-interactive,hostbased)", job 7798240). It stops after the first
+# failed login so it does not keep retrying.
+TUNNEL=${TUNNEL:-0}
+if [ "$TUNNEL" != 0 ]; then
+    (
+        while kill -0 $SRV 2>/dev/null; do
+            grep -q 'Permission denied' "$STATE/tunnel_${JOBID}.log" 2>/dev/null && break
+            ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+                -o StrictHostKeyChecking=accept-new -N -R 127.0.0.1:11519:127.0.0.1:11519 "$TUNNEL" \
+                >> "$STATE/tunnel_${JOBID}.log" 2>&1
+            ts "tunnel to $TUNNEL exited rc=$?" >> "$STATE/tunnel_${JOBID}.log"
+            sleep 10
+        done
+    ) &
+    ts "tunnel to $TUNNEL started"
+fi
+wait $SRV
