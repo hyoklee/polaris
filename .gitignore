@@ -67,3 +67,11 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Editor backups, Python caches
+*~
+__pycache__/
+
+# Local-only files
+/CLAUDE.md
+/src/clio-core/
